@@ -126,6 +126,7 @@ CellList::~CellList() {
     cudaFree(sorted_pos.x);
     cudaFree(sorted_pos.y);
     cudaFree(sorted_pos.z);
+    cudaFree(d_temp_storage);
 }
 
 void CellList::generate(State& state, bool* flag) {

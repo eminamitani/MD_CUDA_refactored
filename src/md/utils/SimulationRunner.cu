@@ -9,6 +9,8 @@
 #include <md/temperature_schedulers/TemperatureScheduler.cuh>
 #include <md/thermostats/Thermostat.cuh>
 #include <md/utils/NeighbourList.cuh>
+#include <md/utils/NeighbourList_CLL.cuh>
+#include <md/utils/CellList.cuh>
 #include <md/convergence_checkers/ConvChecker.cuh>
 #include <md/energy_minimizers/EnergyMinimizer.cuh>
 
@@ -37,6 +39,9 @@
 #include <md/convergence_checkers/MaxNorm.cuh>
 #include <md/energy_minimizers/FireMinimizer.cuh>
 #include <md/thermostats/KinEnergyCalculator.cuh>
+
+#include <algorithm>
+#include <cmath>
 
 using namespace md::utils;
 using namespace md;
@@ -80,17 +85,24 @@ void SimulationRunner::run() {
         string name = step.at("name");
         std::cout << "シミュレーション: " << name << "を実行します。" << std::endl;
 
+        string step_mode = step.value("step", j.value("step", string("")));
+        if (step_mode == "reset") {
+            state->current_steps = 0;
+        }
+
         // オブザーバーの初期化
-        this->build_observer(step.at("observer"));
+        if (step.contains("observer")) {
+            this->build_observer(step.at("observer"));
+        } else if (step.contains("output")) {
+            this->build_observer(step.at("output"));
+        } else {
+            throw std::runtime_error("stepにはobserverまたはoutputが必要です。");
+        }
 
         if (step.contains("simulation")) {
             json s_setting = step.at("simulation");
 
             state->dt = s_setting.at("dt");
-
-            if (j.value("step", "") == "reset") {
-                state->current_steps = 0;
-            }
 
             // アンサンブルの初期化
             this->build_ensemble(s_setting.at("ensemble"));
@@ -315,29 +327,58 @@ void SimulationRunner::build_ensemble(const json& e_setting) {
 }
 
 void SimulationRunner::build_interaction(const json& i_setting) {
-    bool use_cll = i_setting.value("cell_list", false);
+    // neighbour listの初期化
+    json n_setting = i_setting.at("neighbour_list");
+    float cutoff = n_setting.value("cutoff", 5.0f);
+    float margin = n_setting.value("margin", 1.0f);
+
+    // potantialの初期化
+    json p_setting = i_setting.at("potentials");
+    string p_type = p_setting.value("type", "lennard_jones");
+
+    bool use_cll = false;
+    int cell_list_divisions = 0;
+    if (i_setting.contains("cell_list")) {
+        const auto& cl_setting = i_setting.at("cell_list");
+        if (cl_setting.is_boolean()) {
+            use_cll = cl_setting.get<bool>();
+        } else if (cl_setting.is_object()) {
+            use_cll = cl_setting.value("enabled", true);
+            cell_list_divisions = cl_setting.value("divisions", 0);
+        } else {
+            throw std::runtime_error("cell_listはboolまたはobjectで指定してください。");
+        }
+    }
 
     if (use_cll) {
-        /*
-        if (p_type == "lennard_jones") {
-            this->interaction = md::utils::initialize::init_LJPotential_CLL_from_json(p_setting, *state, cell.get(), nl.get());
-        } else throw std::runtime_error("未対応のpotential typeです: " + p_type);
-        */
+        if (p_type != "lennard_jones") {
+            throw std::runtime_error("cell_list=trueは現在lennard_jonesポテンシャルでのみ対応しています。");
+        }
 
-        throw std::runtime_error("セルリスト法にはまだ未対応です。(実装はありますがSimulationRunner側が対応していないです。そのうち対応します。)");
+        auto* cubic_cell = dynamic_cast<md::cells::CubicCell*>(cell.get());
+        if (cubic_cell == nullptr) {
+            throw std::runtime_error("cell_list=trueはcubic cellでのみ対応しています。");
+        }
 
+        const float cutoff_margin = cutoff + margin;
+        const float lbox = cubic_cell->lattice[0][0];
+        if (cell_list_divisions <= 0) {
+            cell_list_divisions = static_cast<int>(std::floor(lbox / cutoff_margin));
+        }
+        if (cell_list_divisions < 3) {
+            throw std::runtime_error("cell_list=trueには3以上のセル分割数が必要です。cutoff/marginを小さくするかcell_list=falseにしてください。");
+        }
+        if (lbox / static_cast<float>(cell_list_divisions) < cutoff_margin) {
+            throw std::runtime_error("cell_list.divisionsが大きすぎます。セル幅がcutoff+margin以上になるようにしてください。");
+        }
+
+        this->cll = std::make_unique<CellList>(cell_list_divisions, lbox, *state);
+        this->nl_cll = std::make_unique<NeighbourList_CLL>(*state, cutoff, margin, *cll);
+        nl_cll->generate(*state, *cubic_cell);
+        this->interaction = md::utils::initialize::init_LJPotential_CLL_from_json(p_setting, *state, *cubic_cell, nl_cll.get());
     } else {
-        // neighbour listの初期化
-        json n_setting = i_setting.at("neighbour_list");
-        float cutoff = n_setting.value("cutoff", 5.0f);
-        float margin = n_setting.value("margin", 1.0f);
-
         this->nl = std::make_unique<NeighbourList>(*state, cutoff, margin);
         nl->generate(*state, cell.get());
-
-        // potantialの初期化
-        json p_setting = i_setting.at("potentials");
-        string p_type = p_setting.value("type", "lennard_jones");
 
         if (p_type == "lennard_jones") {
             this->interaction = md::utils::initialize::init_LJPotential_from_json(p_setting, *state, cell.get(), nl.get());

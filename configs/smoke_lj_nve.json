@@ -1,0 +1,50 @@
+{
+    "meta": {
+        "name": "smoke_lj_nve",
+        "unit": "lj",
+        "seed": 12345
+    },
+    "common_settings": {
+        "atoms": {
+            "mode": "generate_binary_lj",
+            "n_atoms": 32,
+            "density": 0.8,
+            "ratio": [0.8, 0.2]
+        },
+        "cell": {
+            "type": "cubic"
+        },
+        "interactions": {
+            "cell_list": false,
+            "neighbour_list": {
+                "cutoff": 2.0,
+                "margin": 0.7
+            },
+            "potentials": {
+                "type": "lennard_jones",
+                "numbers": [0, 1],
+                "sigma": [1.0, 0.8, 0.8, 0.88],
+                "epsilon": [1.0, 1.5, 1.5, 0.5],
+                "cutoff": [1.5, 2.0, 2.0, 1.5]
+            }
+        }
+    },
+    "steps": [
+        {
+            "name": "smoke NVE run",
+            "simulation": {
+                "dt": 5e-3,
+                "simulation_time": 2e-2,
+                "ensemble": {
+                    "type": "NVE",
+                    "temperature": 1.0
+                },
+                "use_graph": false
+            },
+            "observer": {
+                "type": "linear",
+                "interval": 1
+            }
+        }
+    ]
+}

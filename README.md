@@ -1,4 +1,174 @@
-## Dependencies
-This project uses the following third-party libraries:
+# MD_CUDA_refactored
 
-* [nlohmann/json](https://github.com/nlohmann/json) - JSON for Modern C++ (MIT License)
+CUDA/C++ molecular dynamics code with Lennard-Jones and neural-network
+potential backends.
+
+## Dependencies
+
+- CUDA toolkit with `nvcc`
+- CMake 3.18 or newer
+- A C++17 compiler supported by CUDA
+- Python development headers
+- PyTorch/libtorch with CMake package files
+- Optional: ONNX Runtime, only if an ONNX backend is added/enabled
+- [nlohmann/json](https://github.com/nlohmann/json), vendored under `include/external`
+
+## Build
+
+Configure by pointing CMake to your local PyTorch CMake package. With a Python
+wheel install of PyTorch, `Torch_DIR` is usually under the Python environment's
+`site-packages/torch/share/cmake/Torch`.
+
+```sh
+cmake -G Ninja -S . -B build \
+  -D CMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
+  -D Torch_DIR=/path/to/site-packages/torch/share/cmake/Torch \
+  -D MD_CUDA_ARCHITECTURES=86
+ninja -C build
+```
+
+Alternatively, set `LIBTORCH_PATH` to the PyTorch package/root and CMake will
+look for `share/cmake/Torch` below it.
+
+```sh
+cmake -G Ninja -S . -B build \
+  -D CMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
+  -D LIBTORCH_PATH=/path/to/site-packages/torch \
+  -D MD_CUDA_ARCHITECTURES=86
+```
+
+If ONNX Runtime is needed by future code paths, add:
+
+```sh
+-D ONNXRUNTIME_ROOT=/path/to/onnxruntime
+```
+
+## Run
+
+The executable takes one JSON workflow file:
+
+```sh
+./build/MD_MLP configs/example_workflow_bussi.json
+```
+
+For a quick GPU smoke test, run:
+
+```sh
+./build/MD_MLP configs/smoke_lj_nve.json
+```
+
+## Hydra test environment
+
+On `hydra`, the repository can be tested under:
+
+```text
+/home/emi/workspace/MD_CUDA_refactored_codex
+```
+
+The installed NVIDIA driver reports CUDA 12.2 support, so use the CUDA 12.2
+toolkit instead of the `/usr/local/cuda` symlink if that points at a newer
+toolkit:
+
+```sh
+CUDA_HOME=/usr/local/cuda-12.2 CUDA_PATH=/usr/local/cuda-12.2 \
+cmake -G "Unix Makefiles" -S . -B build-codex \
+  -D CMAKE_C_COMPILER=/opt/rh/devtoolset-11/root/usr/bin/gcc \
+  -D CMAKE_CXX_COMPILER=/opt/rh/devtoolset-11/root/usr/bin/g++ \
+  -D CMAKE_CUDA_COMPILER=/usr/local/cuda-12.2/bin/nvcc \
+  -D CMAKE_CUDA_HOST_COMPILER=/opt/rh/devtoolset-11/root/usr/bin/g++ \
+  -D CUDAToolkit_ROOT=/usr/local/cuda-12.2 \
+  -D CUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda-12.2 \
+  -D Torch_DIR=/home/emi/miniforge3/envs/edamame_md/lib/python3.13/site-packages/torch/share/cmake/Torch \
+  -D MD_CUDA_ARCHITECTURES=75
+cmake --build build-codex -j2
+./build-codex/MD_MLP configs/smoke_lj_nve.json
+```
+
+## JSON workflow overview
+
+Top-level keys:
+
+- `meta`: `name`, `unit` (`lj` or `metal`), and random `seed`
+- `common_settings`: atoms, cell, neighbour list, and potential settings
+- `steps`: one or more simulation or minimization steps
+
+Supported atom initialization:
+
+- `generate_binary_lj`
+- `from_file` with `format: "xyz"`
+
+The XYZ reader expects an extended XYZ `Lattice="..."` comment and atom lines in
+this order:
+
+```text
+species x y z fx fy fz
+```
+
+Supported cell:
+
+- `cubic`
+
+Supported potentials:
+
+- `lennard_jones`
+- `NNP`
+- `NNP_csr`
+- `NNP_aoti`
+
+Supported ensembles:
+
+- `NVE`
+- `NVT` with `Nose-Hoover`, `Bussi`, or `Langevin`
+
+Supported minimizer:
+
+- `fire`
+
+Each step should contain `observer`. The legacy key `output` is still accepted
+as an alias. Set `"step": "reset"` inside a step to reset the step counter
+before that step starts.
+
+## Neural-network potential interface
+
+`NNP` and `NNP_aoti` expect models with inputs:
+
+- `x`: `int64[N]` atomic numbers
+- `edge_index`: `int64[2, E]`
+- `edge_weight`: `float32[3, E]` relative displacement vectors
+
+`NNP_csr` additionally passes:
+
+- `offsets`: `int64[N + 1]`
+
+All NNP variants expect a tuple-like output:
+
+```text
+(energy, forces)
+```
+
+where `energy` is a scalar tensor and `forces` is laid out as x/y/z components
+for all atoms.
+
+The AOTI example uses relative placeholders:
+
+- `data/sample_NS2.xyz`
+- `models/model_schnet_aoti.pt2`
+
+Place the corresponding structure and model files there before running
+`configs/example_workflow_NVE_NNP_aoti.json`.
+
+## Cell list
+
+`cell_list` can be either a boolean or an object:
+
+```json
+"cell_list": {
+  "enabled": true,
+  "divisions": 6
+}
+```
+
+The cell-list path is currently enabled only for Lennard-Jones with a cubic
+cell. If `divisions` is omitted, it is inferred from `Lbox / (cutoff + margin)`.
+The cell width must be at least `cutoff + margin`, and at least three divisions
+are required to avoid duplicated periodic neighbor cells.
