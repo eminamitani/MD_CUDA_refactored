@@ -98,11 +98,15 @@ Supported atom initialization:
 - `from_file` with `format: "xyz"`
 
 The XYZ reader expects an extended XYZ `Lattice="..."` comment and atom lines in
-this order:
+one of these forms:
 
 ```text
 species x y z fx fy fz
+species x y z
 ```
+
+When force columns are omitted, initial forces are set to zero. Only the first
+frame is read from a multi-frame XYZ file.
 
 Supported cell:
 
@@ -126,7 +130,49 @@ Supported minimizer:
 
 Each step should contain `observer`. The legacy key `output` is still accepted
 as an alias. Set `"step": "reset"` inside a step to reset the step counter
-before that step starts.
+before that step starts. Velocities are initialized only once by default; set
+`"initialize_velocities": true` in a step's ensemble to force reinitialization,
+or `false` to keep existing velocities.
+
+`use_graph=true` enables CUDA Graph capture for graph-safe interactions. It is
+currently supported for Lennard-Jones interactions only. Use `use_graph=false`
+for `NNP`, `NNP_csr`, and `NNP_aoti`.
+
+Supported observers include:
+
+- `linear`: print energies every fixed number of steps
+- `log`: print energies on a simple logarithmic time grid
+- `linear_export_trajectory`: write extxyz trajectory frames every fixed number
+  of steps
+- `log_export_trajectory`: write one extxyz trajectory frame at each simple
+  logarithmic time point
+- `dense_log_burst_export_trajectory`: write an MSD/time-average friendly
+  trajectory with dense early sampling followed by log-spaced anchors and short
+  fixed-interval bursts
+- `target_temperature_export`: write structures when a linear temperature
+  schedule crosses target temperatures
+
+For `dense_log_burst_export_trajectory`, a T3400K-style setup is:
+
+```json
+"observer": {
+  "type": "dense_log_burst_export_trajectory",
+  "output_path": "./outputs/trajectory/MSD_T3400_style.xyz",
+  "is_unwrap": true,
+  "N_per_decade": 5,
+  "M_burst": 10,
+  "interval_burst": 10,
+  "dense_until": "auto",
+  "write_metadata": true
+}
+```
+
+With `dense_until: "auto"`, the code emits every early step until adjacent
+log-spaced burst windows no longer overlap. Later frames contain extxyz comment
+metadata such as `step_rel`, `step_abs`, `time_fs`, `sample_type`, `burst_id`,
+and `burst_idx`, which makes time-window grouping easier in downstream MSD or
+VACF analysis. Keep `use_graph=false` for dense or burst trajectory sampling so
+the observer is called every MD step.
 
 ## Neural-network potential interface
 
@@ -147,7 +193,8 @@ All NNP variants expect a tuple-like output:
 ```
 
 where `energy` is a scalar tensor and `forces` is laid out as x/y/z components
-for all atoms.
+for all atoms. The runtime validates `max_edges` and output tensor shapes before
+copying forces.
 
 The AOTI example uses relative placeholders:
 
@@ -156,6 +203,30 @@ The AOTI example uses relative placeholders:
 
 Place the corresponding structure and model files there before running
 `configs/example_workflow_NVE_NNP_aoti.json`.
+
+### Exporting simplegnn PaiNN for `NNP`
+
+The PaiNN model in `eminamitani/simplegnn_version2` has a Python training
+interface with `batch` and returns forces as `[N, 3]`. The MD `NNP` backend
+expects a TorchScript model with three inputs and forces laid out as x/y/z
+blocks. Export a compatible wrapper with:
+
+```sh
+python scripts/export_simplegnn_painn_for_md.py \
+  --simplegnn-root /path/to/simplegnn_version2 \
+  --checkpoint /path/to/painn_model.pth \
+  --output models/deployed_painn_model.pt \
+  --natom-basis 60 \
+  --n-radial 40 \
+  --cutoff 5.0 \
+  --epsilon 1e-7 \
+  --num-interactions 2 \
+  --radial-type gauss \
+  --envelope-type smoothstep
+```
+
+Then set the potential type to `NNP` and point `model_path` to the exported
+`.pt` file.
 
 ## Cell list
 

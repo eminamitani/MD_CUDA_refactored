@@ -6,7 +6,12 @@
 
 #include <md/core/State.cuh>
 #include <md/utils/NeighbourList.cuh>
+#include <md/utils/CudaCheck.cuh>
 #include <md/cells/Cell.cuh>
+
+#include <sstream>
+#include <stdexcept>
+#include <utility>
 
 namespace {
     __global__ void count_pairs_kernel(
@@ -144,6 +149,38 @@ namespace {
         edge_weight_ptr[num_max_edges + pad_idx] = 0.0f;
         edge_weight_ptr[2 * num_max_edges + pad_idx] = 0.0f;
     }
+    std::pair<torch::Tensor, torch::Tensor> unpack_nnp_csr_output(const c10::IValue& result, int num_atoms, const char* backend_name) {
+        if (!result.isTuple()) {
+            throw std::runtime_error(std::string(backend_name) + " model must return a tuple: (energy, forces).");
+        }
+
+        auto result_tuple = result.toTuple();
+        const auto& elements = result_tuple->elements();
+        if (elements.size() < 2) {
+            throw std::runtime_error(std::string(backend_name) + " model output tuple must contain energy and forces.");
+        }
+        if (!elements[0].isTensor() || !elements[1].isTensor()) {
+            throw std::runtime_error(std::string(backend_name) + " model output elements must be tensors.");
+        }
+
+        auto energy = elements[0].toTensor().to(torch::kFloat32).contiguous().detach();
+        auto forces = elements[1].toTensor().to(torch::kFloat32).contiguous().detach();
+
+        if (!energy.is_cuda() || !forces.is_cuda()) {
+            throw std::runtime_error(std::string(backend_name) + " model outputs must be CUDA tensors.");
+        }
+        if (energy.numel() < 1) {
+            throw std::runtime_error(std::string(backend_name) + " energy output must contain at least one value.");
+        }
+        if (forces.numel() != static_cast<int64_t>(3) * num_atoms) {
+            std::ostringstream oss;
+            oss << backend_name << " force output must contain exactly 3*N values in x/y/z block layout. "
+                << "Expected " << (3 * num_atoms) << ", got " << forces.numel() << ".";
+            throw std::runtime_error(oss.str());
+        }
+
+        return {energy, forces};
+    }
 }
 
 using namespace md::interactions;
@@ -171,11 +208,15 @@ NNP_CSR::NNP_CSR(
     auto N = state.n_atoms;
 
     // メモリの確保
-    cudaMalloc(&x_ptr, N * sizeof(int64_t));
-    cudaMalloc(&edge_index_ptr, 2 * num_max_edges * sizeof(int64_t));
-    cudaMalloc(&edge_weight_ptr, 3 * num_max_edges * sizeof(float));
-    cudaMalloc(&offsets_ptr, (N + 1) * sizeof(int64_t));
-    cudaMalloc(&counts, N * sizeof(int));
+    if (num_max_edges <= 0) {
+        throw std::runtime_error("NNP_CSR max_edges must be positive.");
+    }
+
+    MD_CUDA_CHECK(cudaMalloc(&x_ptr, N * sizeof(int64_t)));
+    MD_CUDA_CHECK(cudaMalloc(&edge_index_ptr, 2 * num_max_edges * sizeof(int64_t)));
+    MD_CUDA_CHECK(cudaMalloc(&edge_weight_ptr, 3 * num_max_edges * sizeof(float)));
+    MD_CUDA_CHECK(cudaMalloc(&offsets_ptr, (N + 1) * sizeof(int64_t)));
+    MD_CUDA_CHECK(cudaMalloc(&counts, N * sizeof(int)));
 
     // 原子番号はシミュレーションを通して変わらないため、最初に初期化する
     // int32_t -> int64_t
@@ -188,7 +229,7 @@ NNP_CSR::NNP_CSR(
 
     // torch::Tensorをメモリのビューとして作成
     int current_device;
-    cudaGetDevice(&current_device);
+    MD_CUDA_CHECK(cudaGetDevice(&current_device));
     auto opt = torch::TensorOptions().device(torch::Device(torch::kCUDA, current_device));
 
     x = torch::from_blob(x_ptr, {N}, opt.dtype(torch::kInt64));
@@ -197,20 +238,15 @@ NNP_CSR::NNP_CSR(
     offsets = torch::from_blob(offsets_ptr, {N + 1}, opt.dtype(torch::kInt64));
 
     // cubのバッファを確保
-        cub::DeviceScan::ExclusiveSum(
+    MD_CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
         d_temp_storage, 
         temp_storage_bytes, 
         counts, 
         offsets_ptr, 
         N, 
         state.stream
-    );
-    cudaMalloc(&d_temp_storage, temp_storage_bytes);
-
-    // 3回推論しておく
-    for (int i = 0; i < 3; i ++) {
-        model.forward({x, edge_index, edge_weight, offsets});
-    }
+    ));
+    MD_CUDA_CHECK(cudaMalloc(&d_temp_storage, temp_storage_bytes));
 }
 
 NNP_CSR::~NNP_CSR() {
@@ -239,22 +275,35 @@ void NNP_CSR::create_graph(State& state) {
         N, 
         nl->get_max_neighbours()
     );
+    MD_CUDA_KERNEL_CHECK();
 
     // 手前のインデックスまでを加算
-    cub::DeviceScan::ExclusiveSum(
+    MD_CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
         d_temp_storage, 
         temp_storage_bytes, 
         counts, 
         offsets_ptr, 
         N, 
         state.stream
-    );
+    ));
     // offsets_ptr[N]にnum_edgesを書き込む
     append_total_sum_kernel<<<1, 1, 0, state.stream>>>(
         counts, 
         offsets_ptr, 
         N
     );
+    MD_CUDA_KERNEL_CHECK();
+
+    int64_t h_num_edges = 0;
+    MD_CUDA_CHECK(cudaMemcpyAsync(&h_num_edges, offsets_ptr + N, sizeof(int64_t), cudaMemcpyDeviceToHost, state.stream));
+    MD_CUDA_CHECK(cudaStreamSynchronize(state.stream));
+    if (h_num_edges > num_max_edges) {
+        std::ostringstream oss;
+        oss << "NNP_CSR graph has " << h_num_edges << " edges, exceeding max_edges=" << num_max_edges
+            << ". Increase potentials.max_edges or reduce cutoff.";
+        throw std::runtime_error(oss.str());
+    }
+    num_edges = static_cast<int>(h_num_edges);
 
     build_graph_kernel<<<num_blocks, num_threads, 0, state.stream>>>(
         state.pos, 
@@ -270,6 +319,7 @@ void NNP_CSR::create_graph(State& state) {
         nl->get_max_neighbours(), 
         num_max_edges
     );
+    MD_CUDA_KERNEL_CHECK();
 
     int num_blocks_edges = (num_max_edges + num_threads - 1) / num_threads;
     padding_kernel<<<num_blocks_edges, num_threads, 0, state.stream>>>(
@@ -279,6 +329,7 @@ void NNP_CSR::create_graph(State& state) {
         N, 
         num_max_edges
     );
+    MD_CUDA_KERNEL_CHECK();
 }
 
 void NNP_CSR::calc_force(State& state) {
@@ -291,20 +342,15 @@ void NNP_CSR::calc_force(State& state) {
     c10::cuda::CUDAStreamGuard guard(torch_stream);
 
     auto result_iv = model.forward({x, edge_index, edge_weight, offsets});
-
-    auto result_tuple = result_iv.toTuple();
-    auto elements = result_tuple->elements();
-
-    auto energy = elements[0].toTensor().to(torch::kFloat32).detach();
-    auto forces = elements[1].toTensor().to(torch::kFloat32).detach();
+    auto [energy, forces] = unpack_nnp_csr_output(result_iv, N, "NNP_CSR");
 
     // libtorch側のポインター
     float* forces_ptr = forces.data_ptr<float>();
 
     // 値のコピー
-    cudaMemcpyAsync(state.force.x, forces_ptr, N * sizeof(float), cudaMemcpyDeviceToDevice, state.stream);
-    cudaMemcpyAsync(state.force.y, forces_ptr + N, N * sizeof(float), cudaMemcpyDeviceToDevice, state.stream);
-    cudaMemcpyAsync(state.force.z, forces_ptr + 2 * N, N * sizeof(float), cudaMemcpyDeviceToDevice, state.stream);
+    MD_CUDA_CHECK(cudaMemcpyAsync(state.force.x, forces_ptr, N * sizeof(float), cudaMemcpyDeviceToDevice, state.stream));
+    MD_CUDA_CHECK(cudaMemcpyAsync(state.force.y, forces_ptr + N, N * sizeof(float), cudaMemcpyDeviceToDevice, state.stream));
+    MD_CUDA_CHECK(cudaMemcpyAsync(state.force.z, forces_ptr + 2 * N, N * sizeof(float), cudaMemcpyDeviceToDevice, state.stream));
 }
 
 void NNP_CSR::calc_potential(State& state) {
@@ -316,14 +362,9 @@ void NNP_CSR::calc_potential(State& state) {
     c10::cuda::CUDAStreamGuard guard(torch_stream);
 
     auto result_iv = model.forward({x, edge_index, edge_weight, offsets});
-
-    auto result_tuple = result_iv.toTuple();
-    auto elements = result_tuple->elements();
-
-    auto energy = elements[0].toTensor().to(torch::kFloat32).detach();
-    auto forces = elements[1].toTensor().to(torch::kFloat32).detach();
+    auto [energy, forces] = unpack_nnp_csr_output(result_iv, state.n_atoms, "NNP_CSR");
 
     float* energy_ptr = energy.data_ptr<float>();
 
-    cudaMemcpyAsync(&state.potential_energy, energy_ptr, sizeof(float), cudaMemcpyDeviceToHost, state.stream);
+    MD_CUDA_CHECK(cudaMemcpyAsync(&state.potential_energy, energy_ptr, sizeof(float), cudaMemcpyDeviceToHost, state.stream));
 }

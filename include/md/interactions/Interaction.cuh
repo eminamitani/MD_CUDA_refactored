@@ -10,6 +10,7 @@ namespace md {
 
             virtual void calc_force(State& state) = 0;
             virtual void calc_potential(State& state) = 0;
+            virtual bool supports_cuda_graph_capture() const { return false; }
 
         protected:
             Interaction() = default;

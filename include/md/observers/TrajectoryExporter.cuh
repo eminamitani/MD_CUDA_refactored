@@ -17,8 +17,10 @@ namespace md::observers {
         public: 
             TrajectoryExporter(State& state, const std::string& output_path, Cell* cell);
             void export_trajectory(State& state);
+            void export_trajectory(State& state, const std::string& extra_comment);
 
             void export_trajectory_unwrap(State& state);
+            void export_trajectory_unwrap(State& state, const std::string& extra_comment);
 
         private:
             std::ofstream ofs;

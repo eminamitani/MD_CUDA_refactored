@@ -1,0 +1,56 @@
+{
+    "meta": {
+        "name": "smoke_ns2_painn_dense_log_burst",
+        "unit": "metal",
+        "seed": 12345
+    },
+    "common_settings": {
+        "atoms": {
+            "mode": "from_file",
+            "format": "xyz",
+            "path": "./data/ns2_quenched.xyz"
+        },
+        "cell": {
+            "type": "cubic"
+        },
+        "interactions": {
+            "cell_list": false,
+            "neighbour_list": {
+                "cutoff": 5.0,
+                "margin": 1.0,
+                "max_neighbours": 1000
+            },
+            "potentials": {
+                "type": "NNP",
+                "cutoff": 5.0,
+                "max_edges": 1000000,
+                "model_path": "./models/deployed_painn_model_ns2.pt"
+            }
+        }
+    },
+    "steps": [
+        {
+            "name": "smoke NS2 PaiNN dense log burst trajectory",
+            "simulation": {
+                "dt": 0.5,
+                "simulation_time": 1.5,
+                "ensemble": {
+                    "type": "NVE",
+                    "temperature": 300.0,
+                    "initialize_velocities": true
+                },
+                "use_graph": false
+            },
+            "observer": {
+                "type": "dense_log_burst_export_trajectory",
+                "output_path": "./outputs/trajectory/smoke_ns2_painn_dense_log_burst.xyz",
+                "is_unwrap": true,
+                "N_per_decade": 2,
+                "M_burst": 2,
+                "interval_burst": 1,
+                "dense_until": "auto",
+                "write_metadata": true
+            }
+        }
+    ]
+}

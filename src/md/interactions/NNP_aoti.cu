@@ -5,7 +5,11 @@
 
 #include <md/core/State.cuh>
 #include <md/utils/NeighbourList.cuh>
+#include <md/utils/CudaCheck.cuh>
 #include <md/cells/Cell.cuh>
+
+#include <sstream>
+#include <stdexcept>
 
 // #include <torch_tensorrt/torch_tensorrt.h>
 
@@ -115,6 +119,23 @@ namespace {
             }
         }
     }
+    void validate_aoti_outputs(const std::vector<torch::Tensor>& outputs, int num_atoms) {
+        if (outputs.size() < 2) {
+            throw std::runtime_error("NNP_aoti model output must contain energy and forces.");
+        }
+        if (!outputs[0].is_cuda() || !outputs[1].is_cuda()) {
+            throw std::runtime_error("NNP_aoti model outputs must be CUDA tensors.");
+        }
+        if (outputs[0].numel() < 1) {
+            throw std::runtime_error("NNP_aoti energy output must contain at least one value.");
+        }
+        if (outputs[1].numel() != static_cast<int64_t>(3) * num_atoms) {
+            std::ostringstream oss;
+            oss << "NNP_aoti force output must contain exactly 3*N values in x/y/z block layout. "
+                << "Expected " << (3 * num_atoms) << ", got " << outputs[1].numel() << ".";
+            throw std::runtime_error(oss.str());
+        }
+    }
 }
 
 using namespace md::interactions;
@@ -130,11 +151,15 @@ NNP_aoti::NNP_aoti(
     auto N = state.n_atoms;
 
     // メモリの確保
-    cudaMalloc(&x_ptr, N * sizeof(int64_t));
-    cudaMalloc(&edge_weight_ptr, 3 * num_max_edges * sizeof(float));
-    cudaMalloc(&edge_index_ptr, 2 * num_max_edges * sizeof(int64_t));
-    cudaMalloc(&counts, N * sizeof(int));
-    cudaMalloc(&offsets, N * sizeof(int));
+    if (num_max_edges <= 0) {
+        throw std::runtime_error("NNP_aoti max_edges must be positive.");
+    }
+
+    MD_CUDA_CHECK(cudaMalloc(&x_ptr, N * sizeof(int64_t)));
+    MD_CUDA_CHECK(cudaMalloc(&edge_weight_ptr, 3 * num_max_edges * sizeof(float)));
+    MD_CUDA_CHECK(cudaMalloc(&edge_index_ptr, 2 * num_max_edges * sizeof(int64_t)));
+    MD_CUDA_CHECK(cudaMalloc(&counts, N * sizeof(int)));
+    MD_CUDA_CHECK(cudaMalloc(&offsets, N * sizeof(int)));
 
     // 原子番号はシミュレーションを通して変わらないため、最初に初期化する
     // int32_t -> int64_t
@@ -171,6 +196,7 @@ void NNP_aoti::create_graph(State& state) {
         N, 
         nl->get_max_neighbours()
     );
+    MD_CUDA_KERNEL_CHECK();
 
     // 手前のインデックスまでを加算
     thrust::exclusive_scan(
@@ -181,13 +207,19 @@ void NNP_aoti::create_graph(State& state) {
     );
 
     int last_count, last_offset;
-    cudaMemcpyAsync(&last_count, counts + N - 1, sizeof(int), cudaMemcpyDeviceToHost, state.stream);
-    cudaMemcpyAsync(&last_offset, offsets + N - 1, sizeof(int), cudaMemcpyDeviceToHost, state.stream);
+    MD_CUDA_CHECK(cudaMemcpyAsync(&last_count, counts + N - 1, sizeof(int), cudaMemcpyDeviceToHost, state.stream));
+    MD_CUDA_CHECK(cudaMemcpyAsync(&last_offset, offsets + N - 1, sizeof(int), cudaMemcpyDeviceToHost, state.stream));
 
-    cudaStreamSynchronize(state.stream);
+    MD_CUDA_CHECK(cudaStreamSynchronize(state.stream));
 
     int num_pairs = last_offset + last_count;
     num_edges = 2 * num_pairs;
+    if (num_edges > num_max_edges) {
+        std::ostringstream oss;
+        oss << "NNP_aoti graph has " << num_edges << " edges, exceeding max_edges=" << num_max_edges
+            << ". Increase potentials.max_edges or reduce cutoff.";
+        throw std::runtime_error(oss.str());
+    }
 
     build_graph_kernel<<<num_blocks, num_threads, 0, state.stream>>>(
         state.pos, 
@@ -204,6 +236,7 @@ void NNP_aoti::create_graph(State& state) {
         num_edges, 
         num_pairs
     );
+    MD_CUDA_KERNEL_CHECK();
 }
 
 void NNP_aoti::calc_force(State& state) {
@@ -221,15 +254,17 @@ void NNP_aoti::calc_force(State& state) {
 
     c10::InferenceMode mode;
     int current_device;
-    cudaGetDevice(&current_device);
+    MD_CUDA_CHECK(cudaGetDevice(&current_device));
     c10::cuda::CUDAStreamGuard guard(
         c10::cuda::getStreamFromExternal(state.stream, current_device)
     );
     auto outputs = loader.run(inputs);
+    validate_aoti_outputs(outputs, N);
 
-    float* force_ptr = outputs[1].data_ptr<float>();
+    auto forces = outputs[1].to(torch::kFloat32).contiguous();
+    float* force_ptr = forces.data_ptr<float>();
 
-    cudaMemcpyAsync(state.force.x, force_ptr, 3 * N * sizeof(float), cudaMemcpyDeviceToDevice, state.stream);
+    MD_CUDA_CHECK(cudaMemcpyAsync(state.force.x, force_ptr, 3 * N * sizeof(float), cudaMemcpyDeviceToDevice, state.stream));
 }
 
 void NNP_aoti::calc_potential(State& state) {
@@ -247,14 +282,16 @@ void NNP_aoti::calc_potential(State& state) {
 
     c10::InferenceMode mode;
     int current_device;
-    cudaGetDevice(&current_device);
+    MD_CUDA_CHECK(cudaGetDevice(&current_device));
     c10::cuda::CUDAStreamGuard guard(
         c10::cuda::getStreamFromExternal(state.stream, current_device)
     );
 
     auto outputs = loader.run(inputs);
+    validate_aoti_outputs(outputs, N);
 
-    float* energy_ptr = outputs[0].data_ptr<float>();
+    auto energy = outputs[0].to(torch::kFloat32).contiguous();
+    float* energy_ptr = energy.data_ptr<float>();
 
-    cudaMemcpy(&state.potential_energy, energy_ptr, sizeof(float), cudaMemcpyDeviceToHost);
+    MD_CUDA_CHECK(cudaMemcpy(&state.potential_energy, energy_ptr, sizeof(float), cudaMemcpyDeviceToHost));
 }

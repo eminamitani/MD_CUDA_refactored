@@ -19,7 +19,12 @@ TrajectoryExporter::TrajectoryExporter(State& state, const std::string& output_p
 
     species.resize(N);
     for (size_t i = 0; i < N; i ++) {
-        species[i] = atom_number_map[h_atomic_numbers[i] - 1];
+        int atomic_number = h_atomic_numbers[i];
+        if (atomic_number >= 1 && atomic_number <= static_cast<int>(atom_number_map.size())) {
+            species[i] = atom_number_map[atomic_number - 1];
+        } else {
+            species[i] = "X" + std::to_string(atomic_number);
+        }
     }
 
     h_pos.resize(3 * N);
@@ -28,6 +33,10 @@ TrajectoryExporter::TrajectoryExporter(State& state, const std::string& output_p
 }
 
 void TrajectoryExporter::export_trajectory(State& state) {
+    export_trajectory(state, "");
+}
+
+void TrajectoryExporter::export_trajectory(State& state, const std::string& extra_comment) {
     auto lattice = cell->lattice;
     
     size_t N = state.n_atoms;
@@ -47,7 +56,11 @@ void TrajectoryExporter::export_trajectory(State& state) {
     // ファイルに出力
     ofs << std::setprecision(7) << std::scientific;
     ofs << N << "\n";
-    ofs << "Lattice=\"" << lattice[0][0] << " 0.0 0.0 0.0 " << lattice[1][1] << " 0.0 0.0 0.0 " << lattice[2][2] << "\" " << "Properties=species:S:1:pos:R:3:forces:R:3 energy=" << state.potential_energy << " pbc=\"T T T\"" << "\n";
+    ofs << "Lattice=\"" << lattice[0][0] << " 0.0 0.0 0.0 " << lattice[1][1] << " 0.0 0.0 0.0 " << lattice[2][2] << "\" " << "Properties=species:S:1:pos:R:3:forces:R:3 energy=" << state.potential_energy << " pbc=\"T T T\"";
+    if (!extra_comment.empty()) {
+        ofs << " " << extra_comment;
+    }
+    ofs << "\n";
     for (size_t i = 0; i < N; i ++) {
         ofs << species[i] << " "
             << h_pos[i] << " " << h_pos[N + i] << " " << h_pos[2 * N + i] << " "
@@ -56,6 +69,10 @@ void TrajectoryExporter::export_trajectory(State& state) {
 }
 
 void TrajectoryExporter::export_trajectory_unwrap(State& state) {
+    export_trajectory_unwrap(state, "");
+}
+
+void TrajectoryExporter::export_trajectory_unwrap(State& state, const std::string& extra_comment) {
     auto lattice = cell->lattice;
 
     size_t N = state.n_atoms;
@@ -80,7 +97,11 @@ void TrajectoryExporter::export_trajectory_unwrap(State& state) {
     // ファイルに出力
     ofs << std::setprecision(7) << std::scientific;
     ofs << N << "\n";
-    ofs << "Lattice=\"" << lattice[0][0] << " 0.0 0.0 0.0 " << lattice[1][1] << " 0.0 0.0 0.0 " << lattice[2][2] << "\" " << "Properties=species:S:1:pos:R:3:forces:R:3 energy=" << state.potential_energy << " pbc=\"F F F\"" << "\n";
+    ofs << "Lattice=\"" << lattice[0][0] << " 0.0 0.0 0.0 " << lattice[1][1] << " 0.0 0.0 0.0 " << lattice[2][2] << "\" " << "Properties=species:S:1:pos:R:3:forces:R:3 energy=" << state.potential_energy << " pbc=\"F F F\"";
+    if (!extra_comment.empty()) {
+        ofs << " " << extra_comment;
+    }
+    ofs << "\n";
     for (size_t i = 0; i < N; i ++) {
         ofs << species[i] << " "
             << h_pos[i] + h_box[i] * lattice[0][0] << " " 

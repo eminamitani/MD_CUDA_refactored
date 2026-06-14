@@ -17,7 +17,7 @@ namespace md {
 
     class NeighbourList {
         public:
-            NeighbourList(State& state, float _cutoff, float _margin);
+            NeighbourList(State& state, float _cutoff, float _margin, int _max_neighbours = 1000);
             ~NeighbourList();
 
             void generate(State& state, Cell* cell);
@@ -34,10 +34,11 @@ namespace md {
             dfloat3 nl_conf;
             int* list;
             int* count;
-            size_t max_neighbours;
+            int max_neighbours;
 
             Top2* top2;
             bool* flag;
+            int* overflow_count = nullptr;
 
             // cub用のバッファとそのサイズ
             void* d_temp_storage = nullptr;
@@ -45,5 +46,7 @@ namespace md {
 
             // カーネル起動スレッド数
             int generate_nl_num_threads = 0;
+
+            void throw_if_overflow(State& state, const char* context);
         };
 }

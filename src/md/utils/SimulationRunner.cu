@@ -1,5 +1,6 @@
 #include <md/utils/SimulationRunner.hpp>
 #include <md/utils/initialize.cuh>
+#include <md/utils/CudaCheck.cuh>
 
 #include <md/core/State.cuh>
 #include <md/integrators/Integrator.cuh>
@@ -35,6 +36,7 @@
 #include <md/interactions/NNP_aoti.cuh>
 #include <md/observers/LinearExportTrajectory.cuh>
 #include <md/observers/LogExportTrajectory.cuh>
+#include <md/observers/DenseLogBurstExportTrajectory.cuh>
 #include <md/observers/TargetTemperatureExporter.cuh>
 #include <md/convergence_checkers/MaxNorm.cuh>
 #include <md/energy_minimizers/FireMinimizer.cuh>
@@ -90,11 +92,11 @@ void SimulationRunner::run() {
             state->current_steps = 0;
         }
 
-        // オブザーバーの初期化
+        const json* observer_setting = nullptr;
         if (step.contains("observer")) {
-            this->build_observer(step.at("observer"));
+            observer_setting = &step.at("observer");
         } else if (step.contains("output")) {
-            this->build_observer(step.at("output"));
+            observer_setting = &step.at("output");
         } else {
             throw std::runtime_error("stepにはobserverまたはoutputが必要です。");
         }
@@ -103,6 +105,12 @@ void SimulationRunner::run() {
             json s_setting = step.at("simulation");
 
             state->dt = s_setting.at("dt");
+            const long long total_steps = static_cast<long long>(
+                s_setting.at("simulation_time").get<double>() / static_cast<double>(state->dt)
+            );
+
+            // オブザーバーの初期化
+            this->build_observer(*observer_setting, total_steps);
 
             // アンサンブルの初期化
             this->build_ensemble(s_setting.at("ensemble"));
@@ -112,9 +120,17 @@ void SimulationRunner::run() {
                 // 時間の計測
             auto start = std::chrono::steady_clock::now();
 
+            bool use_graph = s_setting.value("use_graph", false);
+            if (use_graph && !interaction->supports_cuda_graph_capture()) {
+                throw std::runtime_error(
+                    "use_graph=true is not supported by the selected interaction. "
+                    "Use use_graph=false for NNP, NNP_csr, and NNP_aoti backends."
+                );
+            }
+
             // シミュレーションの実行
-            simulator.run(s_setting.at("simulation_time"), s_setting.at("use_graph"));
-            cudaDeviceSynchronize();
+            simulator.run(s_setting.at("simulation_time"), use_graph);
+            MD_CUDA_CHECK(cudaDeviceSynchronize());
 
             auto end = std::chrono::steady_clock::now();
             double elapsed_s = std::chrono::duration<double>(end - start).count();
@@ -123,6 +139,7 @@ void SimulationRunner::run() {
 
         } else if (step.contains("minimize")) {
             json mi_setting = step.at("minimize");
+            this->build_observer(*observer_setting);
             // チェッカーの初期化
             this->build_checker(mi_setting.at("checker"));
             // ミニマイザーの初期化
@@ -130,7 +147,7 @@ void SimulationRunner::run() {
 
             auto start = std::chrono::steady_clock::now();
             minimizer->run();
-            cudaDeviceSynchronize();
+            MD_CUDA_CHECK(cudaDeviceSynchronize());
 
             auto end = std::chrono::steady_clock::now();
             double elapsed_s = std::chrono::duration<double>(end - start).count();
@@ -193,7 +210,7 @@ void SimulationRunner::build_cell(const json& c_setting) {
     }
 }
 
-void SimulationRunner::build_observer(const json& o_setting) {
+void SimulationRunner::build_observer(const json& o_setting, long long total_steps) {
     string o_type = o_setting.value("type", "linear");
 
     if (o_type == "linear") {
@@ -244,6 +261,45 @@ void SimulationRunner::build_observer(const json& o_setting) {
             output_path
         );
 
+    } else if (o_type == "dense_log_burst_export_trajectory") {
+        int n_per_decade = o_setting.value("N_per_decade", o_setting.value("divisions", 5));
+        int burst_length = o_setting.value("M_burst", o_setting.value("burst_length", 10));
+        int burst_interval = o_setting.value("interval_burst", o_setting.value("burst_interval", 10));
+        bool is_unwrap = o_setting.value("is_unwrap", true);
+        bool write_metadata = o_setting.value("write_metadata", true);
+        bool include_initial = o_setting.value("include_initial", true);
+        string output_path = o_setting.at("output_path").get<string>();
+
+        bool auto_dense_until = true;
+        long long dense_until = 1;
+        if (o_setting.contains("dense_until")) {
+            const auto& dense_setting = o_setting.at("dense_until");
+            if (dense_setting.is_string()) {
+                const string dense_mode = dense_setting.get<string>();
+                if (dense_mode != "auto") {
+                    throw std::runtime_error("dense_until string must be \"auto\".");
+                }
+            } else {
+                auto_dense_until = false;
+                dense_until = dense_setting.get<long long>();
+            }
+        }
+
+        this->observer = std::make_unique<md::observers::DenseLogBurstExportTrajectory>(
+            n_per_decade,
+            burst_length,
+            burst_interval,
+            total_steps,
+            dense_until,
+            auto_dense_until,
+            write_metadata,
+            include_initial,
+            is_unwrap,
+            *state,
+            cell.get(),
+            output_path
+        );
+
     } else if (o_type == "target_temperature_export") {
         std::vector<float> target_temperatures = o_setting.at("target_temperatures").get<std::vector<float>>();
         float initial_temperature = o_setting.at("initial_temperature").get<float>();
@@ -267,14 +323,21 @@ void SimulationRunner::build_observer(const json& o_setting) {
 
 void SimulationRunner::build_ensemble(const json& e_setting) {
     string ensemble = e_setting.value("type", "NVE");
+    bool initialize_velocities = e_setting.value("initialize_velocities", e_setting.value("init_velocities", !velocities_initialized));
 
         if (ensemble == "NVE") {
-            md::utils::initialize::init_velocities(*state, e_setting.at("temperature"), mt);
+            if (initialize_velocities) {
+                md::utils::initialize::init_velocities(*state, e_setting.at("temperature"), mt);
+                velocities_initialized = true;
+            }
             this->thermostat = std::make_unique<md::thermostats::NoThermostat>();
             this->integrator = std::make_unique<md::integrators::ConstantVolume>(this->thermostat.get());
 
         } else if (ensemble == "NVT") {
-            md::utils::initialize::init_velocities(*state, e_setting.at("temperature"), mt);
+            if (initialize_velocities) {
+                md::utils::initialize::init_velocities(*state, e_setting.at("temperature"), mt);
+                velocities_initialized = true;
+            }
             
             // Schedulerの構築
             string sched_type = e_setting.value("scheduler", "constant");
@@ -377,7 +440,8 @@ void SimulationRunner::build_interaction(const json& i_setting) {
         nl_cll->generate(*state, *cubic_cell);
         this->interaction = md::utils::initialize::init_LJPotential_CLL_from_json(p_setting, *state, *cubic_cell, nl_cll.get());
     } else {
-        this->nl = std::make_unique<NeighbourList>(*state, cutoff, margin);
+        int max_neighbours = n_setting.value("max_neighbours", 1000);
+        this->nl = std::make_unique<NeighbourList>(*state, cutoff, margin, max_neighbours);
         nl->generate(*state, cell.get());
 
         if (p_type == "lennard_jones") {

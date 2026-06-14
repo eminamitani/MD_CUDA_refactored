@@ -50,11 +50,12 @@ namespace md::utils {
 
             std::array<std::array<float, 3>, 3> lattice;
             std::mt19937 mt;
+            bool velocities_initialized = false;
 
             void configure_units(const nlohmann::json& m_setting);
             void build_state(const nlohmann::json& a_setting);
             void build_cell(const nlohmann::json& c_setting);
-            void build_observer(const nlohmann::json& o_setting);
+            void build_observer(const nlohmann::json& o_setting, long long total_steps = -1);
             void build_ensemble(const nlohmann::json& e_setting);
             void build_interaction(const nlohmann::json& i_setting);
             void build_checker(const nlohmann::json& ch_setting);

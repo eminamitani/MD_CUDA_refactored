@@ -38,6 +38,7 @@ namespace md::interactions {
 
             void calc_force(State& state) override;
             void calc_potential(State& state) override;
+            bool supports_cuda_graph_capture() const override { return true; }
 
         private: 
             int num_species;

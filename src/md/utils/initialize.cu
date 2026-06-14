@@ -11,6 +11,7 @@
 #include <iomanip>
 
 #include <algorithm>
+#include <stdexcept>
 
 namespace {
     //文字列からLatticeを見つける
@@ -108,6 +109,9 @@ std::unique_ptr<md::State> initialize::read_state_from_xyz(std::array<std::array
     std::string line;
     std::getline(file, line);
     int N = std::stoi(line);
+    if (N <= 0) {
+        throw std::runtime_error("XYZの原子数が正ではありません: " + path);
+    }
 
     auto state = std::make_unique<md::State>(N);
 
@@ -122,6 +126,9 @@ std::unique_ptr<md::State> initialize::read_state_from_xyz(std::array<std::array
     iss >> lattice_x[0] >> lattice_x[1] >> lattice_x[2] >> 
            lattice_y[0] >> lattice_y[1] >> lattice_y[2] >>
            lattice_z[0] >> lattice_z[1] >> lattice_z[2];
+    if (!iss) {
+        throw std::runtime_error("Latticeには9個の数値が必要です: " + path);
+    }
     lattice = {lattice_x, lattice_y, lattice_z};
 
     // 原子の情報を保持する変数
@@ -137,19 +144,39 @@ std::unique_ptr<md::State> initialize::read_state_from_xyz(std::array<std::array
     std::vector<float> h_force_z(N);
     std::vector<float> h_masses(N);
 
-    int i = 0;
+    for (int i = 0; i < N; i ++) {
+        if (!std::getline(file, line)) {
+            throw std::runtime_error("XYZの原子行が不足しています: " + path);
+        }
 
-    while(std::getline(file, line)) {
         std::string atom_type;
 
         std::istringstream iss(line);
 
-        iss >> atom_type >> h_x[i] >> h_y[i] >> h_z[i] >> h_force_x[i] >> h_force_y[i] >> h_force_z[i];
-        
-        h_atomic_numbers[i] = atom_number_map.at(atom_type);
-        h_masses[i] = atom_mass_map.at(atom_type);
+        if (!(iss >> atom_type >> h_x[i] >> h_y[i] >> h_z[i])) {
+            throw std::runtime_error("XYZ原子行の形式が不正です: " + path + " line " + std::to_string(i + 3));
+        }
 
-        i ++;
+        float fx = 0.0f;
+        float fy = 0.0f;
+        float fz = 0.0f;
+        if (iss >> fx) {
+            if (!(iss >> fy >> fz)) {
+                throw std::runtime_error("XYZ force列は3成分が必要です: " + path + " line " + std::to_string(i + 3));
+            }
+        }
+        h_force_x[i] = fx;
+        h_force_y[i] = fy;
+        h_force_z[i] = fz;
+
+        auto number_it = atom_number_map.find(atom_type);
+        auto mass_it = atom_mass_map.find(atom_type);
+        if (number_it == atom_number_map.end() || mass_it == atom_mass_map.end()) {
+            throw std::runtime_error("未対応の元素です: " + atom_type + " in " + path);
+        }
+
+        h_atomic_numbers[i] = number_it->second;
+        h_masses[i] = mass_it->second;
     }
 
     // デバイスに転送
