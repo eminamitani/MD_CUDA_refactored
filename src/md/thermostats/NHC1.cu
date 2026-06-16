@@ -76,8 +76,8 @@ namespace {
 
 using namespace md::thermostats;
 
-NHC1::NHC1(const float _tau, TemperatureScheduler *_scheduler)
- :  tau(_tau), scheduler(_scheduler) {
+NHC1::NHC1(const float _tau, TemperatureScheduler *_scheduler, int _configured_dof)
+ :  tau(_tau), configured_dof(_configured_dof), scheduler(_scheduler) {
     cudaMalloc(&c_state.pos, sizeof(float));
     cudaMalloc(&c_state.vel, sizeof(float));
     cudaMalloc(&c_state.force, sizeof(float));
@@ -94,7 +94,10 @@ NHC1::~NHC1() {
 }
 
 void NHC1::init(State& state) {
-    this->dof = 3.0f * state.n_atoms;
+    this->dof = static_cast<float>(configured_dof > 0 ? configured_dof : state.thermostat_dof);
+    if (this->dof <= 0.0f) {
+        this->dof = 3.0f * state.n_atoms;
+    }
     this->calculator = std::make_unique<KinEnergyCalculator>(state);
 
     float zero = 0.0f;

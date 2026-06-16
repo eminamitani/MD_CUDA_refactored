@@ -16,7 +16,7 @@ void TargetTemperatureExporter::output(State& state) {
     if (state.current_steps == target_steps[counter]) {
         // 温度の計算
         float K = md::utils::compute::calc_kinetic_energy(state);
-        int dof = 3 * state.n_atoms;
+        int dof = md::utils::compute::temperature_degrees_of_freedom(state);
         float temperature = 2 * K / (dof * boltzmann_constant);
 
         std::cout << "current temperature: " << temperature << std::endl;

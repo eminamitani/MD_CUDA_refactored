@@ -219,7 +219,13 @@ std::array<std::array<float, 3>, 3> initialize::find_lattice_from_xyz(const std:
     return lattice;
 }
 
-void initialize::init_velocities(State& state, float temperature, std::mt19937& mt) {
+void initialize::init_velocities(
+    State& state,
+    float temperature,
+    std::mt19937& mt,
+    bool rescale_temperature,
+    int temperature_dof
+) {
     // デバイスから質量を転送
     auto N = state.n_atoms;
     std::vector<float> h_mass(N);
@@ -249,6 +255,9 @@ void initialize::init_velocities(State& state, float temperature, std::mt19937& 
 
     // 全体速度の除去
     md::utils::compute::remove_drift(state);
+    if (rescale_temperature) {
+        md::utils::compute::rescale_temperature(state, temperature, temperature_dof);
+    }
 }
 
 std::unique_ptr<md::State> initialize::generate_binary_lj(const int n_atoms, const float density, std::array<std::array<float, 3>, 3>& lattice, const float a_ratio, std::mt19937 &mt) {

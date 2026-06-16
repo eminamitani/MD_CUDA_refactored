@@ -1,0 +1,56 @@
+{
+    "meta": {
+        "name": "smoke_ns2_painn_nnp_dof_comdrift",
+        "unit": "metal",
+        "seed": 12345
+    },
+    "common_settings": {
+        "atoms": {
+            "mode": "from_file",
+            "format": "xyz",
+            "path": "./data/ns2_quenched.xyz"
+        },
+        "cell": {
+            "type": "cubic"
+        },
+        "interactions": {
+            "cell_list": false,
+            "neighbour_list": {
+                "cutoff": 5.0,
+                "margin": 1.0,
+                "max_neighbours": 1000
+            },
+            "potentials": {
+                "type": "NNP",
+                "cutoff": 5.0,
+                "max_edges": 1000000,
+                "model_path": "./models/deployed_painn_model_ns2.pt"
+            }
+        }
+    },
+    "steps": [
+        {
+            "name": "smoke NS2 PaiNN NVT with 3N-3 DOF and COM drift removal",
+            "simulation": {
+                "dt": 0.5,
+                "simulation_time": 0.5,
+                "ensemble": {
+                    "type": "NVT",
+                    "temperature": 300.0,
+                    "thermostat": "Nose-Hoover",
+                    "tau": 1.0,
+                    "initialize_velocities": true,
+                    "rescale_initial_temperature": true,
+                    "temperature_dof": "3N-3",
+                    "thermostat_dof": "3N-3",
+                    "remove_com_drift_interval": 128
+                },
+                "use_graph": false
+            },
+            "observer": {
+                "type": "linear",
+                "interval": 1
+            }
+        }
+    ]
+}

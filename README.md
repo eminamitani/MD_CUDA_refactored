@@ -134,6 +134,30 @@ before that step starts. Velocities are initialized only once by default; set
 `"initialize_velocities": true` in a step's ensemble to force reinitialization,
 or `false` to keep existing velocities.
 
+Thermal degrees of freedom and COM drift handling can be set per ensemble step.
+By default, both temperature reporting and thermostats use the legacy `3N`
+definition and no in-run COM drift removal is applied. For PBC bulk runs where
+the whole-system COM motion is removed, use:
+
+```json
+"ensemble": {
+  "type": "NVT",
+  "temperature": 2500.0,
+  "thermostat": "Nose-Hoover",
+  "tau": 1.0,
+  "temperature_dof": "3N-3",
+  "thermostat_dof": "3N-3",
+  "rescale_initial_temperature": true,
+  "remove_com_drift_interval": 128
+}
+```
+
+`temperature_dof` controls reported temperature, initial-temperature rescaling,
+and target-temperature export checks. `thermostat_dof` controls the Nose-Hoover
+and Bussi thermostat target kinetic energy. `remove_com_drift_interval` removes
+the mass-weighted whole-system COM velocity after completed MD steps; it requires
+`use_graph=false`.
+
 `use_graph=true` enables CUDA Graph capture for graph-safe interactions. It is
 currently supported for Lennard-Jones interactions only. Use `use_graph=false`
 for `NNP`, `NNP_csr`, and `NNP_aoti`.

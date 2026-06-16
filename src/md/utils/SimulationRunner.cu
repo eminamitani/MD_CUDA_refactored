@@ -43,6 +43,7 @@
 #include <md/thermostats/KinEnergyCalculator.cuh>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 
 using namespace md::utils;
@@ -50,6 +51,53 @@ using namespace md;
 
 using string = std::string;
 using json = nlohmann::json;
+
+namespace {
+    int parse_dof_string(const string& spec, int n_atoms) {
+        string normalized;
+        normalized.reserve(spec.size());
+        for (char c : spec) {
+            if (std::isspace(static_cast<unsigned char>(c)) || c == '_' || c == '*') {
+                continue;
+            }
+            normalized.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+        }
+
+        if (normalized == "3N") {
+            return 3 * n_atoms;
+        }
+        if (normalized == "3N-3" || normalized == "3NMINUS3") {
+            return std::max(1, 3 * n_atoms - 3);
+        }
+
+        try {
+            return std::stoi(normalized);
+        } catch (const std::exception&) {
+            throw std::runtime_error("未対応の自由度指定です: " + spec);
+        }
+    }
+
+    int resolve_dof(const json& setting, const string& key, int n_atoms, int default_dof) {
+        if (!setting.contains(key)) {
+            return default_dof;
+        }
+
+        const auto& value = setting.at(key);
+        int dof = default_dof;
+        if (value.is_number_integer()) {
+            dof = value.get<int>();
+        } else if (value.is_string()) {
+            dof = parse_dof_string(value.get<string>(), n_atoms);
+        } else {
+            throw std::runtime_error(key + " は整数または文字列で指定してください。");
+        }
+
+        if (dof <= 0) {
+            throw std::runtime_error(key + " は正の値である必要があります。");
+        }
+        return dof;
+    }
+}
 
 SimulationRunner::SimulationRunner(const string& setting_path) {
     // jsonのロード
@@ -324,10 +372,36 @@ void SimulationRunner::build_observer(const json& o_setting, long long total_ste
 void SimulationRunner::build_ensemble(const json& e_setting) {
     string ensemble = e_setting.value("type", "NVE");
     bool initialize_velocities = e_setting.value("initialize_velocities", e_setting.value("init_velocities", !velocities_initialized));
+    bool rescale_initial_temperature = e_setting.value("rescale_initial_temperature", false);
+
+    const int default_dof = 3 * state->n_atoms;
+    state->temperature_dof = resolve_dof(e_setting, "temperature_dof", state->n_atoms, default_dof);
+    state->thermostat_dof = resolve_dof(e_setting, "thermostat_dof", state->n_atoms, state->temperature_dof);
+    state->com_drift_removal_interval = e_setting.value(
+        "remove_com_drift_interval",
+        e_setting.value("com_drift_removal_interval", e_setting.value("drift_removal_interval", 0))
+    );
+    if (e_setting.value("remove_com_drift", false) && state->com_drift_removal_interval <= 0) {
+        state->com_drift_removal_interval = 1;
+    }
+    if (state->com_drift_removal_interval < 0) {
+        throw std::runtime_error("COM drift removal interval must be non-negative.");
+    }
+
+    std::cout << "temperature_dof=" << state->temperature_dof
+              << ", thermostat_dof=" << state->thermostat_dof
+              << ", com_drift_removal_interval=" << state->com_drift_removal_interval
+              << std::endl;
 
         if (ensemble == "NVE") {
             if (initialize_velocities) {
-                md::utils::initialize::init_velocities(*state, e_setting.at("temperature"), mt);
+                md::utils::initialize::init_velocities(
+                    *state,
+                    e_setting.at("temperature"),
+                    mt,
+                    rescale_initial_temperature,
+                    state->temperature_dof
+                );
                 velocities_initialized = true;
             }
             this->thermostat = std::make_unique<md::thermostats::NoThermostat>();
@@ -335,7 +409,13 @@ void SimulationRunner::build_ensemble(const json& e_setting) {
 
         } else if (ensemble == "NVT") {
             if (initialize_velocities) {
-                md::utils::initialize::init_velocities(*state, e_setting.at("temperature"), mt);
+                md::utils::initialize::init_velocities(
+                    *state,
+                    e_setting.at("temperature"),
+                    mt,
+                    rescale_initial_temperature,
+                    state->temperature_dof
+                );
                 velocities_initialized = true;
             }
             
@@ -356,7 +436,7 @@ void SimulationRunner::build_ensemble(const json& e_setting) {
             string thermo_type = e_setting.value("thermostat", "Nose-Hoover");
             if (thermo_type == "Nose-Hoover") {
                 auto nhc = std::make_unique<md::thermostats::NHC1>(
-                    e_setting.value("tau", 1.0f), this->scheduler.get()
+                    e_setting.value("tau", 1.0f), this->scheduler.get(), state->thermostat_dof
                 );
                 nhc->init(*state);
                 this->thermostat = std::move(nhc);
@@ -366,7 +446,7 @@ void SimulationRunner::build_ensemble(const json& e_setting) {
             else if (thermo_type == "Bussi") {
                 float tau = e_setting.value("tau", 1.0f); 
                 int seed = e_setting.value("seed", 12345);
-                auto bussi = std::make_unique<md::thermostats::BussiThermostat>(tau, this->scheduler.get());
+                auto bussi = std::make_unique<md::thermostats::BussiThermostat>(tau, this->scheduler.get(), state->thermostat_dof);
                 bussi->init(*state, seed);
                 this->thermostat = std::move(bussi);
                 this->integrator = std::make_unique<md::integrators::ConstantVolume>(this->thermostat.get());

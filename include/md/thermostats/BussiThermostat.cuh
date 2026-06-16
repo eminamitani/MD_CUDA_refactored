@@ -18,7 +18,8 @@ namespace md {
 namespace md::thermostats {
     class BussiThermostat : public Thermostat {
         public: 
-            BussiThermostat(const float _tau, TemperatureScheduler *_scheduler) : tau(_tau), scheduler(_scheduler) {
+            BussiThermostat(const float _tau, TemperatureScheduler *_scheduler, int _configured_dof = 0)
+                : tau(_tau), configured_dof(_configured_dof), scheduler(_scheduler) {
                 cudaMalloc(&scaling_factor, sizeof(float));
                 cudaMalloc(&curand_state, sizeof(curandState));
             }
@@ -34,6 +35,7 @@ namespace md::thermostats {
         private:
             float tau;
             int dof;
+            int configured_dof = 0;
             TemperatureScheduler* scheduler = nullptr;
             std::unique_ptr<KinEnergyCalculator> calculator;
             float* scaling_factor = nullptr;

@@ -78,7 +78,10 @@ namespace {
 using namespace md::thermostats;
 
 void BussiThermostat::init(State& state, unsigned long long seed) {
-    this->dof = 3 * state.n_atoms;
+    this->dof = configured_dof > 0 ? configured_dof : state.thermostat_dof;
+    if (this->dof <= 0) {
+        this->dof = 3 * state.n_atoms;
+    }
     this->calculator = std::make_unique<KinEnergyCalculator>(state);
 
     init_curand<<<1, 1>>>(

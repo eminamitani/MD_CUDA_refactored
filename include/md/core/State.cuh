@@ -26,6 +26,9 @@ namespace md {
             float dt = 0.0f;
             int current_steps = 0;
             float potential_energy = 0;
+            int temperature_dof = 0;
+            int thermostat_dof = 0;
+            int com_drift_removal_interval = 0;
 
             cudaStream_t stream;
 
@@ -56,6 +59,8 @@ namespace md {
                 cudaMalloc(&kinetic_energy, sizeof(float));
                 cudaStreamCreate(&stream);
                 this->n_atoms = N;
+                this->temperature_dof = 3 * N;
+                this->thermostat_dof = 3 * N;
 
                 cudaMemset(box.x, 0, N * sizeof(int));
                 cudaMemset(box.y, 0, N * sizeof(int));

@@ -21,7 +21,7 @@ struct ChainState {
 namespace md::thermostats {
     class NHC1 : public Thermostat {
         public: 
-            NHC1(const float _tau, TemperatureScheduler *_scheduler);
+            NHC1(const float _tau, TemperatureScheduler *_scheduler, int _configured_dof = 0);
             ~NHC1();
             void stepOne(State& state) override;
             void stepTwo(State& state) override;
@@ -33,6 +33,7 @@ namespace md::thermostats {
             
             float tau = 0.0f; 
             float dof = 0.0f;
+            int configured_dof = 0;
             ChainState c_state;
             TemperatureScheduler *scheduler = nullptr;
             std::unique_ptr<KinEnergyCalculator> calculator;
