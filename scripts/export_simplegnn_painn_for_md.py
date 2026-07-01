@@ -32,9 +32,10 @@ from torch import Tensor
 class PainnMDNNPWrapper(torch.nn.Module):
     """Adapter from simplegnn PaiNN to the MD NNP TorchScript ABI."""
 
-    def __init__(self, base: torch.nn.Module):
+    def __init__(self, base: torch.nn.Module, e0_lookup: Tensor):
         super().__init__()
         self.base = base
+        self.register_buffer("e0_lookup", e0_lookup)
 
     def forward(
         self,
@@ -54,10 +55,12 @@ class PainnMDNNPWrapper(torch.nn.Module):
 
         batch = torch.zeros(Z.shape[0], dtype=torch.long, device=Z.device)
         energy, forces, _ = self.base(Z, edge_index, edge_weight_e3, batch)
+        e0_lookup = self.e0_lookup.to(device=energy.device)
+        baseline = e0_lookup[Z.long()].to(dtype=energy.dtype).sum()
 
         # MD expects a contiguous force buffer [fx_0..fx_N, fy_0.., fz_0..].
         forces_soa = forces.reshape(-1, 3).transpose(0, 1).contiguous()
-        return energy.sum(), forces_soa
+        return energy.sum() + baseline, forces_soa
 
 
 def _torch_load(path: Path, device: torch.device) -> Any:
@@ -92,6 +95,26 @@ def _parse_radial_kwargs(raw: str) -> dict[str, Any]:
     return parsed
 
 
+def _load_energy_baseline_lookup(path: Path | None) -> Tensor:
+    lookup_size = 119
+    if path is None:
+        return torch.zeros(lookup_size, dtype=torch.float32)
+    with path.open("r", encoding="utf-8") as handle:
+        metadata = json.load(handle)
+    if metadata.get("kind") in (None, "none"):
+        return torch.zeros(lookup_size, dtype=torch.float32)
+    if metadata.get("kind") != "element_ls":
+        raise ValueError(f"Unsupported energy baseline kind: {metadata.get('kind')!r}")
+    e0_by_z = {int(z): float(value) for z, value in metadata.get("e0_eV", {}).items()}
+    if not e0_by_z:
+        raise ValueError(f"{path} has no e0_eV entries")
+    lookup_size = max(lookup_size, max(e0_by_z) + 1)
+    lookup = torch.zeros(lookup_size, dtype=torch.float32)
+    for atomic_number, value in e0_by_z.items():
+        lookup[atomic_number] = value
+    return lookup
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Export a simplegnn PaiNN checkpoint as an MD-compatible TorchScript NNP model.",
@@ -105,6 +128,7 @@ def parse_args() -> argparse.Namespace:
         help="Path to the simplegnn_version2 repository if simplegnn is not installed",
     )
     parser.add_argument("--device", default="cpu", help="Device used while exporting, default: cpu")
+    parser.add_argument("--energy-baseline-json", type=Path, default=None)
     parser.add_argument("--natom-basis", type=int, default=60)
     parser.add_argument("--n-radial", type=int, default=40)
     parser.add_argument("--cutoff", type=float, default=5.0)
@@ -144,7 +168,8 @@ def main() -> int:
     base.load_state_dict(_extract_state_dict(checkpoint))
     base.to(device).eval()
 
-    wrapper = PainnMDNNPWrapper(base).to(device).eval()
+    e0_lookup = _load_energy_baseline_lookup(args.energy_baseline_json).to(device)
+    wrapper = PainnMDNNPWrapper(base, e0_lookup).to(device).eval()
     scripted = torch.jit.script(wrapper)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
