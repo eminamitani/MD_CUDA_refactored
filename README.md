@@ -302,8 +302,12 @@ python scripts/export_simplegnn_painn_for_md.py \
 New exports use the MD-only PaiNN forward path by default.  It preserves the
 three-input `(x, edge_index, edge_weight)` ABI and returns the same total energy
 and forces while skipping batch aggregation, virial construction, and the
-higher-order training graph.  Pass `--forward-mode legacy` to export the former
-training-forward wrapper for parity or regression checks.
+retention of the higher-order training graph after the force derivative.  The
+derivative itself uses PaiNN's legacy `create_graph=True` path because some
+models exceed the strict force-parity tolerance with the alternate backward
+kernel selected by `create_graph=False`; it is detached immediately.  Pass
+`--forward-mode legacy` to export the former training-forward wrapper for parity
+or regression checks.
 
 Then set the potential type to `NNP` and point `model_path` to the exported
 `.pt` file.

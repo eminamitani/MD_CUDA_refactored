@@ -69,7 +69,8 @@ class PainnMDInferenceWrapper(torch.nn.Module):
     Training PaiNN evaluates batch aggregation and a virial-like tensor and
     keeps the force graph for force-loss backpropagation.  MD needs only total
     energy and first-derivative forces, so this wrapper reuses the trained
-    modules while avoiding those training-only operations.
+    modules, omits batch/virial work, and detaches the derivative before it is
+    returned to MD.
     """
 
     def __init__(self, base: torch.nn.Module, e0_lookup: Tensor):
@@ -117,9 +118,15 @@ class PainnMDInferenceWrapper(torch.nn.Module):
         diff_energy = torch.autograd.grad(
             [atom_energy.sum()],
             [edge_weight_e3],
-            create_graph=False,
+            # Some PaiNN backward kernels take a numerically different path
+            # when create_graph=False.  Gen6 force parity exceeds the strict
+            # 1e-5 eV/A export tolerance in that mode, so retain the legacy
+            # derivative path and detach immediately after the first
+            # derivative instead of returning a force graph to MD.
+            create_graph=True,
         )[0]
         assert diff_energy is not None
+        diff_energy = diff_energy.detach()
 
         force_i = torch.zeros(
             (node_scalar.shape[0], 3),
