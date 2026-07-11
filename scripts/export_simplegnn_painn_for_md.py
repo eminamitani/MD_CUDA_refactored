@@ -30,7 +30,7 @@ from torch import Tensor
 
 
 class PainnMDNNPWrapper(torch.nn.Module):
-    """Adapter from simplegnn PaiNN to the MD NNP TorchScript ABI."""
+    """Legacy adapter from simplegnn PaiNN to the MD NNP TorchScript ABI."""
 
     def __init__(self, base: torch.nn.Module, e0_lookup: Tensor):
         super().__init__()
@@ -61,6 +61,80 @@ class PainnMDNNPWrapper(torch.nn.Module):
         # MD expects a contiguous force buffer [fx_0..fx_N, fy_0.., fz_0..].
         forces_soa = forces.reshape(-1, 3).transpose(0, 1).contiguous()
         return energy.sum() + baseline, forces_soa
+
+
+class PainnMDInferenceWrapper(torch.nn.Module):
+    """PaiNN force-only inference path for the MD NNP TorchScript ABI.
+
+    Training PaiNN evaluates batch aggregation and a virial-like tensor and
+    keeps the force graph for force-loss backpropagation.  MD needs only total
+    energy and first-derivative forces, so this wrapper reuses the trained
+    modules while avoiding those training-only operations.
+    """
+
+    def __init__(self, base: torch.nn.Module, e0_lookup: Tensor):
+        super().__init__()
+        self.embedding = base.embedding
+        self.message_layers = base.message_layers
+        self.mixing_layers = base.mixing_layers
+        self.output = base.output
+        self.register_buffer("e0_lookup", e0_lookup)
+
+        # Only the displacement tensor needs gradients during MD inference.
+        for parameter in self.parameters():
+            parameter.requires_grad_(False)
+
+    def forward(
+        self,
+        Z: Tensor,
+        edge_index: Tensor,
+        edge_weight: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
+        if Z.dtype != torch.long:
+            Z = Z.long()
+        if edge_index.dtype != torch.long:
+            edge_index = edge_index.long()
+
+        edge_weight_e3 = edge_weight.transpose(0, 1).contiguous()
+        edge_weight_e3 = edge_weight_e3.detach().requires_grad_(True)
+
+        node_scalar = self.embedding(Z)
+        node_vector = torch.zeros(
+            (node_scalar.shape[0], 3, node_scalar.shape[1]),
+            dtype=node_scalar.dtype,
+            device=node_scalar.device,
+        )
+        for message, mixing in zip(self.message_layers, self.mixing_layers):
+            node_scalar, node_vector = message(
+                node_scalar,
+                node_vector,
+                edge_index,
+                edge_weight_e3,
+            )
+            node_scalar, node_vector = mixing(node_scalar, node_vector)
+
+        atom_energy = self.output(node_scalar)
+        diff_energy = torch.autograd.grad(
+            [atom_energy.sum()],
+            [edge_weight_e3],
+            create_graph=False,
+        )[0]
+        assert diff_energy is not None
+
+        force_i = torch.zeros(
+            (node_scalar.shape[0], 3),
+            dtype=atom_energy.dtype,
+            device=atom_energy.device,
+        )
+        force_j = torch.zeros_like(force_i)
+        index_i = edge_index[0].unsqueeze(1)
+        index_j = edge_index[1].unsqueeze(1)
+        force_i = torch.scatter_add(force_i, 0, index_i.expand_as(diff_energy), diff_energy)
+        force_j = torch.scatter_add(force_j, 0, index_j.expand_as(diff_energy), -diff_energy)
+        forces_soa = (force_i + force_j).transpose(0, 1).contiguous()
+
+        baseline = self.e0_lookup[Z].to(dtype=atom_energy.dtype).sum()
+        return atom_energy.sum() + baseline, forces_soa
 
 
 def _torch_load(path: Path, device: torch.device) -> Any:
@@ -129,6 +203,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", default="cpu", help="Device used while exporting, default: cpu")
     parser.add_argument("--energy-baseline-json", type=Path, default=None)
+    parser.add_argument(
+        "--forward-mode",
+        choices=("md", "legacy"),
+        default="md",
+        help="Use the MD-only inference path (default) or the legacy training forward path.",
+    )
     parser.add_argument("--natom-basis", type=int, default=60)
     parser.add_argument("--n-radial", type=int, default=40)
     parser.add_argument("--cutoff", type=float, default=5.0)
@@ -169,7 +249,10 @@ def main() -> int:
     base.to(device).eval()
 
     e0_lookup = _load_energy_baseline_lookup(args.energy_baseline_json).to(device)
-    wrapper = PainnMDNNPWrapper(base, e0_lookup).to(device).eval()
+    if args.forward_mode == "md":
+        wrapper = PainnMDInferenceWrapper(base, e0_lookup).to(device).eval()
+    else:
+        wrapper = PainnMDNNPWrapper(base, e0_lookup).to(device).eval()
     scripted = torch.jit.script(wrapper)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)

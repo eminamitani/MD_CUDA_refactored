@@ -249,6 +249,12 @@ python scripts/export_simplegnn_painn_for_md.py \
   --envelope-type smoothstep
 ```
 
+New exports use the MD-only PaiNN forward path by default.  It preserves the
+three-input `(x, edge_index, edge_weight)` ABI and returns the same total energy
+and forces while skipping batch aggregation, virial construction, and the
+higher-order training graph.  Pass `--forward-mode legacy` to export the former
+training-forward wrapper for parity or regression checks.
+
 Then set the potential type to `NNP` and point `model_path` to the exported
 `.pt` file.
 
