@@ -177,6 +177,47 @@ Supported observers include:
 - `target_temperature_export`: write structures when a linear temperature
   schedule crosses target temperatures
 
+Trajectory-writing observers accept an optional field-selection block:
+
+```json
+"trajectory": {
+  "mode": "vdos",
+  "fields": ["position", "velocity"],
+  "coordinates": "wrapped",
+  "format": "extxyz"
+}
+```
+
+`fields`, when present, overrides the preset field list.  Species is always
+written.  Supported fields are `position`, `velocity`, `force`, and the global
+`energy`.  The presets are:
+
+- `legacy`: position, force, and energy; preserves `is_unwrap`
+- `msd`: unwrapped position
+- `vdos`: wrapped position and velocity
+- `active_learning`: wrapped position, force, and energy
+- `transport_base`: wrapped position, velocity, force, and energy
+
+`vdos` and `transport_base` require `linear_export_trajectory`, because VACF,
+vDOS, and transport postprocessing require uniform time spacing.  Explicit
+trajectory blocks add `time_fs` and field-unit metadata.  Without a trajectory
+block, the previous position/force/energy extxyz schema and `is_unwrap`
+behavior are retained.  `transport_base` is a trajectory input for later
+postprocessing; velocity output alone does not provide the model-internal
+semi-local heat-flux terms required for a complete Green-Kubo implementation.
+
+After running `configs/smoke_ns2_painn_output_modes.json`, validate the field
+schemas, uniform time grid, reconstructed initial temperature, and finite
+VACF/FFT diagnostics with:
+
+```sh
+python scripts/validate_trajectory_output_modes.py \
+  --vdos outputs/trajectory/smoke_ns2_vdos.xyz \
+  --msd outputs/trajectory/smoke_ns2_msd.xyz \
+  --transport-base outputs/trajectory/smoke_ns2_transport_base.xyz \
+  --expected-initial-temperature-k 300
+```
+
 For `dense_log_burst_export_trajectory`, a T3400K-style setup is:
 
 ```json

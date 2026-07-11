@@ -21,6 +21,8 @@ namespace md {
             float* mass_inv;
             int* atomic_numbers;
             float* kinetic_energy;
+            float* cached_potential_energy;
+            bool cached_potential_energy_valid = false;
 
             int n_atoms = 0;
             float dt = 0.0f;
@@ -57,6 +59,8 @@ namespace md {
                 cudaMalloc(&mass_inv, N * sizeof(float));
                 cudaMalloc(&atomic_numbers, N * sizeof(int));
                 cudaMalloc(&kinetic_energy, sizeof(float));
+                cudaMalloc(&cached_potential_energy, sizeof(float));
+                cudaMemset(cached_potential_energy, 0, sizeof(float));
                 cudaStreamCreate(&stream);
                 this->n_atoms = N;
                 this->temperature_dof = 3 * N;
@@ -83,6 +87,7 @@ namespace md {
                 cudaFree(mass_inv);
                 cudaFree(atomic_numbers);
                 cudaFree(kinetic_energy);
+                cudaFree(cached_potential_energy);
                 cudaStreamDestroy(stream);
             }
             void copy(

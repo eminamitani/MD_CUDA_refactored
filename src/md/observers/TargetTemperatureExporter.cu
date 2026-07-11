@@ -22,12 +22,8 @@ void TargetTemperatureExporter::output(State& state) {
         std::cout << "current temperature: " << temperature << std::endl;
 
         std::string output_path = output_folder_path + "output_" + std::to_string((int)target_temperatures[counter]) + ".xyz";
-        TrajectoryExporter exporter(state, output_path, cell);
-        if (is_unwrap) {
-            exporter.export_trajectory_unwrap(state);
-        } else {
-            exporter.export_trajectory(state);
-        }
+        TrajectoryExporter exporter(state, output_path, cell, trajectory_spec);
+        exporter.export_trajectory(state);
         counter ++;
     }
 }

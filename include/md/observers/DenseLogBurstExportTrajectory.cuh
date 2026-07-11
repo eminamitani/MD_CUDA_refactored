@@ -24,10 +24,10 @@ namespace md::observers {
                 bool auto_dense_until,
                 bool write_metadata,
                 bool include_initial,
-                bool is_unwrap,
                 State& state,
                 Cell* cell,
-                const std::string& output_path
+                const std::string& output_path,
+                const TrajectoryOutputSpec& spec
             );
 
             void output(State& state) override;
@@ -71,7 +71,6 @@ namespace md::observers {
             bool auto_dense_until;
             bool write_metadata;
             bool include_initial;
-            bool is_unwrap;
             long double log_ratio;
             long long next_anchor;
             long long run_start_step = 0;

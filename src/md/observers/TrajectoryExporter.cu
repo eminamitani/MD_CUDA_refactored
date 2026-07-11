@@ -3,10 +3,19 @@
 #include <md/cells/Cell.cuh>
 #include <md/core/State.cuh>
 
+#include <sstream>
+
 using namespace md::observers;
 
-TrajectoryExporter::TrajectoryExporter(State& state, const std::string& output_path, Cell* _cell) 
-: cell(_cell), atom_number_map{"H", "He", "Li", "Be", "B", "C", "N", "O", "F", "Ne", "Na", "Mg", "Al", "Si", "P", "S", "Cl", "Ar", "K", "Ca"} {
+TrajectoryExporter::TrajectoryExporter(
+    State& state,
+    const std::string& output_path,
+    Cell* _cell,
+    const TrajectoryOutputSpec& _spec
+) : cell(_cell), spec(_spec), atom_number_map{"H", "He", "Li", "Be", "B", "C", "N", "O", "F", "Ne", "Na", "Mg", "Al", "Si", "P", "S", "Cl", "Ar", "K", "Ca"} {
+    if (spec.format != "extxyz") {
+        throw std::runtime_error("Only extxyz trajectory output is supported.");
+    }
     this->ofs.open(output_path);
     if (!ofs) {
         throw std::runtime_error("出力ファイルが開けませんでした。");
@@ -27,9 +36,10 @@ TrajectoryExporter::TrajectoryExporter(State& state, const std::string& output_p
         }
     }
 
-    h_pos.resize(3 * N);
-    h_force.resize(3 * N);
-    h_box.resize(3 * N);
+    if (spec.position) h_pos.resize(3 * N);
+    if (spec.velocity) h_velocity.resize(3 * N);
+    if (spec.force) h_force.resize(3 * N);
+    if (spec.position && spec.unwrap) h_box.resize(3 * N);
 }
 
 void TrajectoryExporter::export_trajectory(State& state) {
@@ -37,35 +47,7 @@ void TrajectoryExporter::export_trajectory(State& state) {
 }
 
 void TrajectoryExporter::export_trajectory(State& state, const std::string& extra_comment) {
-    auto lattice = cell->lattice;
-    
-    size_t N = state.n_atoms;
-
-    float* h_pos_ptr = h_pos.data();
-    float* h_force_ptr = h_force.data();
-
-    // ホスト側にコピー
-    cudaMemcpy(h_pos_ptr, state.pos.x, N * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_pos_ptr + N, state.pos.y, N * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_pos_ptr + 2 * N, state.pos.z, N * sizeof(float), cudaMemcpyDeviceToHost);
-
-    cudaMemcpy(h_force_ptr, state.force.x, N * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_force_ptr + N, state.force.y, N * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_force_ptr + 2 * N, state.force.z, N * sizeof(float), cudaMemcpyDeviceToHost);
-
-    // ファイルに出力
-    ofs << std::setprecision(7) << std::scientific;
-    ofs << N << "\n";
-    ofs << "Lattice=\"" << lattice[0][0] << " 0.0 0.0 0.0 " << lattice[1][1] << " 0.0 0.0 0.0 " << lattice[2][2] << "\" " << "Properties=species:S:1:pos:R:3:forces:R:3 energy=" << state.potential_energy << " pbc=\"T T T\"";
-    if (!extra_comment.empty()) {
-        ofs << " " << extra_comment;
-    }
-    ofs << "\n";
-    for (size_t i = 0; i < N; i ++) {
-        ofs << species[i] << " "
-            << h_pos[i] << " " << h_pos[N + i] << " " << h_pos[2 * N + i] << " "
-            << h_force[i] << " " << h_force[N + i] << " " << h_force[2 * N + i] << "\n";
-    }
+    export_frame(state, extra_comment, spec.unwrap);
 }
 
 void TrajectoryExporter::export_trajectory_unwrap(State& state) {
@@ -73,40 +55,100 @@ void TrajectoryExporter::export_trajectory_unwrap(State& state) {
 }
 
 void TrajectoryExporter::export_trajectory_unwrap(State& state, const std::string& extra_comment) {
+    export_frame(state, extra_comment, true);
+}
+
+std::string TrajectoryExporter::frame_comment(
+    State& state,
+    const std::string& extra_comment,
+    bool unwrap
+) const {
+    std::ostringstream comment;
+    bool has_comment = false;
+    if (spec.write_field_metadata) {
+        has_comment = true;
+        comment << "trajectory_mode=" << spec.mode
+                << " time_fs=" << std::setprecision(16)
+                << static_cast<double>(state.dt) * static_cast<double>(state.current_steps);
+        if (spec.position) comment << " position_unit=angstrom";
+        if (spec.velocity) comment << " velocity_unit=angstrom_per_fs";
+        if (spec.force) comment << " force_unit=eV_per_angstrom";
+        if (spec.position) comment << " coordinates=" << (unwrap ? "unwrapped" : "wrapped");
+    }
+    if (!extra_comment.empty()) {
+        if (has_comment) comment << " ";
+        comment << extra_comment;
+    }
+    return comment.str();
+}
+
+void TrajectoryExporter::export_frame(
+    State& state,
+    const std::string& extra_comment,
+    bool unwrap
+) {
     auto lattice = cell->lattice;
 
     size_t N = state.n_atoms;
+    if (spec.position) {
+        cudaMemcpyAsync(
+            h_pos.data(), state.pos.x, 3 * N * sizeof(float), cudaMemcpyDeviceToHost, state.stream
+        );
+        if (unwrap) {
+            if (h_box.size() != 3 * N) h_box.resize(3 * N);
+            cudaMemcpyAsync(h_box.data(), state.box.x, N * sizeof(int), cudaMemcpyDeviceToHost, state.stream);
+            cudaMemcpyAsync(h_box.data() + N, state.box.y, N * sizeof(int), cudaMemcpyDeviceToHost, state.stream);
+            cudaMemcpyAsync(h_box.data() + 2 * N, state.box.z, N * sizeof(int), cudaMemcpyDeviceToHost, state.stream);
+        }
+    }
+    if (spec.velocity) {
+        cudaMemcpyAsync(
+            h_velocity.data(), state.vel.x, 3 * N * sizeof(float), cudaMemcpyDeviceToHost, state.stream
+        );
+    }
+    if (spec.force) {
+        cudaMemcpyAsync(
+            h_force.data(), state.force.x, 3 * N * sizeof(float), cudaMemcpyDeviceToHost, state.stream
+        );
+    }
+    if (spec.energy && state.cached_potential_energy_valid) {
+        cudaMemcpyAsync(
+            &state.potential_energy,
+            state.cached_potential_energy,
+            sizeof(float),
+            cudaMemcpyDeviceToHost,
+            state.stream
+        );
+    }
+    cudaStreamSynchronize(state.stream);
 
-    float* h_pos_ptr = h_pos.data();
-    float* h_force_ptr = h_force.data();
-    int* h_box_ptr = h_box.data();
-
-    // ホスト側にコピー
-    cudaMemcpy(h_pos_ptr, state.pos.x, N * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_pos_ptr + N, state.pos.y, N * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_pos_ptr + 2 * N, state.pos.z, N * sizeof(float), cudaMemcpyDeviceToHost);
-
-    cudaMemcpy(h_force_ptr, state.force.x, N * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_force_ptr + N, state.force.y, N * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_force_ptr + 2 * N, state.force.z, N * sizeof(float), cudaMemcpyDeviceToHost);
-
-    cudaMemcpy(h_box_ptr, state.box.x, N * sizeof(int), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_box_ptr + N, state.box.y, N * sizeof(int), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_box_ptr + 2 * N, state.box.z, N * sizeof(int), cudaMemcpyDeviceToHost);
-
-    // ファイルに出力
     ofs << std::setprecision(7) << std::scientific;
     ofs << N << "\n";
-    ofs << "Lattice=\"" << lattice[0][0] << " 0.0 0.0 0.0 " << lattice[1][1] << " 0.0 0.0 0.0 " << lattice[2][2] << "\" " << "Properties=species:S:1:pos:R:3:forces:R:3 energy=" << state.potential_energy << " pbc=\"F F F\"";
-    if (!extra_comment.empty()) {
-        ofs << " " << extra_comment;
-    }
+    ofs << "Lattice=\"" << lattice[0][0] << " 0.0 0.0 0.0 "
+        << lattice[1][1] << " 0.0 0.0 0.0 " << lattice[2][2] << "\" "
+        << "Properties=species:S:1";
+    if (spec.position) ofs << ":pos:R:3";
+    if (spec.velocity) ofs << ":velocities:R:3";
+    if (spec.force) ofs << ":forces:R:3";
+    if (spec.energy) ofs << " energy=" << state.potential_energy;
+    ofs << " pbc=\"" << (unwrap ? "F F F" : "T T T") << "\"";
+    const std::string comment = frame_comment(state, extra_comment, unwrap);
+    if (!comment.empty()) ofs << " " << comment;
     ofs << "\n";
     for (size_t i = 0; i < N; i ++) {
-        ofs << species[i] << " "
-            << h_pos[i] + h_box[i] * lattice[0][0] << " " 
-            << h_pos[N + i] + h_box[N + i] * lattice[1][1] << " " 
-            << h_pos[2 * N + i] + h_box[2 * N + i] * lattice[2][2] << " "
-            << h_force[i] << " " << h_force[N + i] << " " << h_force[2 * N + i] << "\n";
+        ofs << species[i];
+        if (spec.position) {
+            const float x = h_pos[i] + (unwrap ? h_box[i] * lattice[0][0] : 0.0f);
+            const float y = h_pos[N + i] + (unwrap ? h_box[N + i] * lattice[1][1] : 0.0f);
+            const float z = h_pos[2 * N + i] + (unwrap ? h_box[2 * N + i] * lattice[2][2] : 0.0f);
+            ofs << " " << x << " " << y << " " << z;
+        }
+        if (spec.velocity) {
+            ofs << " " << h_velocity[i] << " " << h_velocity[N + i] << " " << h_velocity[2 * N + i];
+        }
+        if (spec.force) {
+            ofs << " " << h_force[i] << " " << h_force[N + i] << " " << h_force[2 * N + i];
+        }
+        ofs << "\n";
     }
 }

@@ -1,0 +1,100 @@
+{
+  "meta": {
+    "name": "smoke_ns2_painn_output_modes",
+    "unit": "metal",
+    "seed": 12345
+  },
+  "common_settings": {
+    "atoms": {
+      "mode": "from_file",
+      "format": "xyz",
+      "path": "./data/ns2_quenched.xyz"
+    },
+    "cell": {
+      "type": "cubic"
+    },
+    "interactions": {
+      "cell_list": false,
+      "neighbour_list": {
+        "cutoff": 5.0,
+        "margin": 1.0,
+        "max_neighbours": 1000
+      },
+      "potentials": {
+        "type": "NNP",
+        "cutoff": 5.0,
+        "max_edges": 1000000,
+        "model_path": "./models/deployed_painn_model_ns2.pt"
+      }
+    }
+  },
+  "steps": [
+    {
+      "name": "vDOS velocity smoke",
+      "simulation": {
+        "dt": 0.5,
+        "simulation_time": 2.0,
+        "ensemble": {
+          "type": "NVE",
+          "temperature": 300.0,
+          "initialize_velocities": true,
+          "rescale_initial_temperature": true
+        },
+        "use_graph": false
+      },
+      "observer": {
+        "type": "linear_export_trajectory",
+        "interval": 1,
+        "output_path": "./outputs/trajectory/smoke_ns2_vdos.xyz",
+        "trajectory": {
+          "mode": "vdos",
+          "format": "extxyz"
+        }
+      }
+    },
+    {
+      "name": "MSD position smoke",
+      "simulation": {
+        "dt": 0.5,
+        "simulation_time": 2.0,
+        "ensemble": {
+          "type": "NVE",
+          "temperature": 300.0,
+          "initialize_velocities": false
+        },
+        "use_graph": false
+      },
+      "observer": {
+        "type": "linear_export_trajectory",
+        "interval": 1,
+        "output_path": "./outputs/trajectory/smoke_ns2_msd.xyz",
+        "trajectory": {
+          "mode": "msd",
+          "format": "extxyz"
+        }
+      }
+    },
+    {
+      "name": "transport base smoke",
+      "simulation": {
+        "dt": 0.5,
+        "simulation_time": 2.0,
+        "ensemble": {
+          "type": "NVE",
+          "temperature": 300.0,
+          "initialize_velocities": false
+        },
+        "use_graph": false
+      },
+      "observer": {
+        "type": "linear_export_trajectory",
+        "interval": 1,
+        "output_path": "./outputs/trajectory/smoke_ns2_transport_base.xyz",
+        "trajectory": {
+          "mode": "transport_base",
+          "format": "extxyz"
+        }
+      }
+    }
+  ]
+}

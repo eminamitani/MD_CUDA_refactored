@@ -97,6 +97,98 @@ namespace {
         }
         return dof;
     }
+
+    md::observers::TrajectoryOutputSpec parse_trajectory_output_spec(
+        const json& observer_setting,
+        const string& observer_type,
+        bool legacy_unwrap
+    ) {
+        md::observers::TrajectoryOutputSpec spec;
+        spec.unwrap = legacy_unwrap;
+        if (!observer_setting.contains("trajectory")) {
+            return spec;
+        }
+
+        const auto& trajectory = observer_setting.at("trajectory");
+        if (!trajectory.is_object()) {
+            throw std::runtime_error("observer.trajectory must be an object.");
+        }
+
+        spec.write_field_metadata = true;
+        spec.mode = trajectory.value("mode", "legacy");
+        spec.format = trajectory.value("format", "extxyz");
+        if (spec.format != "extxyz") {
+            throw std::runtime_error("trajectory.format currently supports only extxyz.");
+        }
+
+        if (spec.mode == "legacy") {
+            spec.position = true;
+            spec.velocity = false;
+            spec.force = true;
+            spec.energy = true;
+            spec.unwrap = legacy_unwrap;
+        } else if (spec.mode == "msd") {
+            spec.position = true;
+            spec.velocity = false;
+            spec.force = false;
+            spec.energy = false;
+            spec.unwrap = true;
+        } else if (spec.mode == "vdos") {
+            spec.position = true;
+            spec.velocity = true;
+            spec.force = false;
+            spec.energy = false;
+            spec.unwrap = false;
+        } else if (spec.mode == "active_learning") {
+            spec.position = true;
+            spec.velocity = false;
+            spec.force = true;
+            spec.energy = true;
+            spec.unwrap = false;
+        } else if (spec.mode == "transport_base") {
+            spec.position = true;
+            spec.velocity = true;
+            spec.force = true;
+            spec.energy = true;
+            spec.unwrap = false;
+        } else {
+            throw std::runtime_error("Unsupported trajectory.mode: " + spec.mode);
+        }
+
+        if ((spec.mode == "vdos" || spec.mode == "transport_base") &&
+            observer_type != "linear_export_trajectory") {
+            throw std::runtime_error(
+                "trajectory.mode=" + spec.mode +
+                " requires linear_export_trajectory for uniform sampling."
+            );
+        }
+
+        if (trajectory.contains("fields")) {
+            if (!trajectory.at("fields").is_array()) {
+                throw std::runtime_error("trajectory.fields must be an array.");
+            }
+            spec.position = false;
+            spec.velocity = false;
+            spec.force = false;
+            spec.energy = false;
+            for (const auto& field_value : trajectory.at("fields")) {
+                const string field = field_value.get<string>();
+                if (field == "position") spec.position = true;
+                else if (field == "velocity") spec.velocity = true;
+                else if (field == "force") spec.force = true;
+                else if (field == "energy") spec.energy = true;
+                else throw std::runtime_error("Unsupported trajectory field: " + field);
+            }
+        }
+
+        if (trajectory.contains("coordinates")) {
+            const string coordinates = trajectory.at("coordinates").get<string>();
+            if (coordinates == "wrapped") spec.unwrap = false;
+            else if (coordinates == "unwrapped") spec.unwrap = true;
+            else throw std::runtime_error("trajectory.coordinates must be wrapped or unwrapped.");
+        }
+        return spec;
+    }
 }
 
 SimulationRunner::SimulationRunner(const string& setting_path) {
@@ -282,31 +374,33 @@ void SimulationRunner::build_observer(const json& o_setting, long long total_ste
 
     } else if (o_type == "linear_export_trajectory") {
         int interval = o_setting.at("interval").get<int>();
-        bool is_unwrap = o_setting.at("is_unwrap").get<bool>();
+        bool is_unwrap = o_setting.value("is_unwrap", false);
         string output_path = o_setting.at("output_path").get<string>();
+        const auto trajectory_spec = parse_trajectory_output_spec(o_setting, o_type, is_unwrap);
 
         this->observer = std::make_unique<md::observers::LinearExportTrajectory>(
             interval, 
-            is_unwrap, 
             *state, 
             cell.get(), 
-            output_path
+            output_path,
+            trajectory_spec
         );
 
     } else if (o_type == "log_export_trajectory") {
         int divisions = o_setting.at("divisions");
         float log_interval = std::pow(10.0f, 1.0f / (float)divisions);
         int counter = 5;
-        bool is_unwrap = o_setting.at("is_unwrap").get<bool>();
+        bool is_unwrap = o_setting.value("is_unwrap", false);
         string output_path = o_setting.at("output_path").get<string>();
+        const auto trajectory_spec = parse_trajectory_output_spec(o_setting, o_type, is_unwrap);
         
         this->observer = std::make_unique<md::observers::LogExportTrajectory>(
             log_interval, 
             counter, 
-            is_unwrap, 
             *state, 
             cell.get(), 
-            output_path
+            output_path,
+            trajectory_spec
         );
 
     } else if (o_type == "dense_log_burst_export_trajectory") {
@@ -317,6 +411,7 @@ void SimulationRunner::build_observer(const json& o_setting, long long total_ste
         bool write_metadata = o_setting.value("write_metadata", true);
         bool include_initial = o_setting.value("include_initial", true);
         string output_path = o_setting.at("output_path").get<string>();
+        const auto trajectory_spec = parse_trajectory_output_spec(o_setting, o_type, is_unwrap);
 
         bool auto_dense_until = true;
         long long dense_until = 1;
@@ -342,10 +437,10 @@ void SimulationRunner::build_observer(const json& o_setting, long long total_ste
             auto_dense_until,
             write_metadata,
             include_initial,
-            is_unwrap,
             *state,
             cell.get(),
-            output_path
+            output_path,
+            trajectory_spec
         );
 
     } else if (o_type == "target_temperature_export") {
@@ -353,7 +448,8 @@ void SimulationRunner::build_observer(const json& o_setting, long long total_ste
         float initial_temperature = o_setting.at("initial_temperature").get<float>();
         float cooling_rate_per_step = o_setting.at("cooling_rate_per_step").get<float>();
         string output_path = o_setting.at("output_path").get<string>();
-        bool is_unwrap = o_setting.at("is_unwrap").get<bool>();
+        bool is_unwrap = o_setting.value("is_unwrap", false);
+        const auto trajectory_spec = parse_trajectory_output_spec(o_setting, o_type, is_unwrap);
 
         this->observer = std::make_unique<md::observers::TargetTemperatureExporter>(
             target_temperatures, 
@@ -361,7 +457,7 @@ void SimulationRunner::build_observer(const json& o_setting, long long total_ste
             cooling_rate_per_step, 
             output_path, 
             cell.get(), 
-            is_unwrap
+            trajectory_spec
         );
 
     } else {

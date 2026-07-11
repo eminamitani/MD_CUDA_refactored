@@ -304,6 +304,16 @@ void NNP::calc_force(State& state) {
 
     // libtorch側のポインター
     float* forces_ptr = forces.data_ptr<float>();
+    float* energy_ptr = energy.data_ptr<float>();
+
+    MD_CUDA_CHECK(cudaMemcpyAsync(
+        state.cached_potential_energy,
+        energy_ptr,
+        sizeof(float),
+        cudaMemcpyDeviceToDevice,
+        state.stream
+    ));
+    state.cached_potential_energy_valid = true;
 
     // 値のコピー
     MD_CUDA_CHECK(cudaMemcpyAsync(state.force.x, forces_ptr, N * sizeof(float), cudaMemcpyDeviceToDevice, state.stream));
@@ -312,6 +322,17 @@ void NNP::calc_force(State& state) {
 }
 
 void NNP::calc_potential(State& state) {
+    if (state.cached_potential_energy_valid) {
+        MD_CUDA_CHECK(cudaMemcpyAsync(
+            &state.potential_energy,
+            state.cached_potential_energy,
+            sizeof(float),
+            cudaMemcpyDeviceToHost,
+            state.stream
+        ));
+        MD_CUDA_CHECK(cudaStreamSynchronize(state.stream));
+        return;
+    }
     nl->check(state, cell);
     create_graph(state);
 
@@ -330,6 +351,20 @@ void NNP::calc_potential(State& state) {
     auto [energy, forces] = unpack_nnp_output(result_iv, N, "NNP");
 
     float* energy_ptr = energy.data_ptr<float>();
-
-    MD_CUDA_CHECK(cudaMemcpy(&state.potential_energy, energy_ptr, sizeof(float), cudaMemcpyDeviceToHost));
+    MD_CUDA_CHECK(cudaMemcpyAsync(
+        state.cached_potential_energy,
+        energy_ptr,
+        sizeof(float),
+        cudaMemcpyDeviceToDevice,
+        state.stream
+    ));
+    state.cached_potential_energy_valid = true;
+    MD_CUDA_CHECK(cudaMemcpyAsync(
+        &state.potential_energy,
+        state.cached_potential_energy,
+        sizeof(float),
+        cudaMemcpyDeviceToHost,
+        state.stream
+    ));
+    MD_CUDA_CHECK(cudaStreamSynchronize(state.stream));
 }

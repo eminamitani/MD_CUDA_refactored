@@ -45,10 +45,10 @@ DenseLogBurstExportTrajectory::DenseLogBurstExportTrajectory(
     bool _auto_dense_until,
     bool _write_metadata,
     bool _include_initial,
-    bool _is_unwrap,
     State& state,
     Cell* cell,
-    const std::string& output_path
+    const std::string& output_path,
+    const TrajectoryOutputSpec& spec
 ) : n_per_decade(_n_per_decade),
     burst_length(_burst_length),
     burst_interval(std::max(1, _burst_interval)),
@@ -57,10 +57,9 @@ DenseLogBurstExportTrajectory::DenseLogBurstExportTrajectory(
     auto_dense_until(_auto_dense_until),
     write_metadata(_write_metadata),
     include_initial(_include_initial),
-    is_unwrap(_is_unwrap),
     log_ratio(std::pow(10.0L, 1.0L / static_cast<long double>(_n_per_decade))),
     next_anchor(1),
-    exporter(state, output_path, cell) {
+    exporter(state, output_path, cell, spec) {
 
     if (n_per_decade < 1) {
         throw std::runtime_error("dense_log_burst_export_trajectory requires N_per_decade >= 1.");
@@ -137,11 +136,7 @@ void DenseLogBurstExportTrajectory::emit(
     std::optional<int> burst_idx
 ) {
     const std::string comment = write_metadata ? metadata(state, type, burst_id, burst_idx) : "";
-    if (is_unwrap) {
-        exporter.export_trajectory_unwrap(state, comment);
-    } else {
-        exporter.export_trajectory(state, comment);
-    }
+    exporter.export_trajectory(state, comment);
 
     const long long relative_step = static_cast<long long>(state.current_steps) - run_start_step;
     const double time = static_cast<double>(state.dt) * static_cast<double>(relative_step);

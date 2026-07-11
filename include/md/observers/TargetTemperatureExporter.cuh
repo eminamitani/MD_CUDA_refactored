@@ -1,6 +1,7 @@
 #pragma once
 
 #include <md/observers/Observer.cuh>
+#include <md/observers/TrajectoryExporter.cuh>
 
 #include <vector>
 #include <string>
@@ -13,8 +14,14 @@ namespace md {
 namespace md::observers {
     class TargetTemperatureExporter : public Observer {
         public:
-            TargetTemperatureExporter(std::vector<float> _target_temperatures, float initial_temperature, float cooling_rate_per_step, std::string _output_folder_path, Cell* _cell, bool _is_unwrap)
-            : target_temperatures(_target_temperatures), output_folder_path(_output_folder_path),  cell(_cell), is_unwrap(_is_unwrap) {
+            TargetTemperatureExporter(
+                std::vector<float> _target_temperatures,
+                float initial_temperature,
+                float cooling_rate_per_step,
+                std::string _output_folder_path,
+                Cell* _cell,
+                const TrajectoryOutputSpec& _trajectory_spec
+            ) : target_temperatures(_target_temperatures), output_folder_path(_output_folder_path), cell(_cell), trajectory_spec(_trajectory_spec) {
                 size_t size = _target_temperatures.size();
                 target_steps.resize(size);
 
@@ -32,7 +39,7 @@ namespace md::observers {
             std::vector<size_t> target_steps;
             std::string output_folder_path;
             Cell* cell;
-            bool is_unwrap;
+            TrajectoryOutputSpec trajectory_spec;
             int counter = 0;
     };
 }
