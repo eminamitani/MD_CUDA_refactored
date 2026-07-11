@@ -14,7 +14,15 @@ namespace md {
 namespace md::interactions {
     class NNP_CSR : public Interaction {
         public: 
-            NNP_CSR(State& state, Cell* _cell, NeighbourList* _nl, float _cutoff, int _num_max_edges, const std::string model_path);
+            NNP_CSR(
+                State& state,
+                Cell* _cell,
+                NeighbourList* _nl,
+                float _cutoff,
+                int _num_max_edges,
+                const std::string model_path,
+                bool _fixed_shape_no_sync = false
+            );
             ~NNP_CSR();
 
             void calc_force(State& state) override;
@@ -25,6 +33,8 @@ namespace md::interactions {
 
             const int num_max_edges;
             int num_edges;
+            bool fixed_shape_no_sync = false;
+            bool initial_edge_count_checked = false;
 
             torch::jit::script::Module model;
             NeighbourList* nl;

@@ -25,6 +25,10 @@ namespace md::interactions {
 
             const int num_max_edges;
             int num_edges;
+            long long graph_samples = 0;
+            long long edge_sum = 0;
+            int edge_min = 0;
+            int edge_max = 0;
 
             torch::jit::script::Module model;
             NeighbourList* nl;

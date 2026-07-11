@@ -11,6 +11,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <utility>
+#include <algorithm>
 
 // #include <torch_tensorrt/torch_tensorrt.h>
 
@@ -200,6 +201,13 @@ NNP::NNP(
 }
 
 NNP::~NNP() {
+    if (graph_samples > 0) {
+        std::cout << "NNP edge telemetry: samples=" << graph_samples
+                  << ", min=" << edge_min
+                  << ", max=" << edge_max
+                  << ", mean=" << static_cast<double>(edge_sum) / static_cast<double>(graph_samples)
+                  << std::endl;
+    }
     cudaFree(x_ptr);
     cudaFree(edge_weight_ptr);
     cudaFree(edge_index_ptr);
@@ -248,6 +256,15 @@ void NNP::create_graph(State& state) {
             << ". Increase potentials.max_edges or reduce cutoff.";
         throw std::runtime_error(oss.str());
     }
+    if (graph_samples == 0) {
+        edge_min = num_edges;
+        edge_max = num_edges;
+    } else {
+        edge_min = std::min(edge_min, num_edges);
+        edge_max = std::max(edge_max, num_edges);
+    }
+    edge_sum += num_edges;
+    ++graph_samples;
 
     build_graph_kernel<<<num_blocks, num_threads, 0, state.stream>>>(
         state.pos, 

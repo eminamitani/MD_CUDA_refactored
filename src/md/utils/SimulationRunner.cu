@@ -172,7 +172,7 @@ void SimulationRunner::run() {
             if (use_graph && !interaction->supports_cuda_graph_capture()) {
                 throw std::runtime_error(
                     "use_graph=true is not supported by the selected interaction. "
-                    "Use use_graph=false for NNP, NNP_csr, and NNP_aoti backends."
+                    "Use use_graph=false for NNP, NNP_csr, NNP_fixed, and NNP_aoti backends."
                 );
             }
 
@@ -553,6 +553,21 @@ void SimulationRunner::build_interaction(const json& i_setting) {
                 cutoff, 
                 max_edges, 
                 model_path
+            );
+
+        } else if (p_type == "NNP_fixed") {
+            float cutoff = p_setting.at("cutoff").get<float>();
+            int max_edges = p_setting.at("max_edges").get<int>();
+            string model_path = p_setting.at("model_path").get<string>();
+
+            this->interaction = std::make_unique<md::interactions::NNP_CSR>(
+                *state,
+                cell.get(),
+                nl.get(),
+                cutoff,
+                max_edges,
+                model_path,
+                true
             );
 
         } else if (p_type == "NNP_aoti") {

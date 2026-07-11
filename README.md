@@ -117,6 +117,7 @@ Supported potentials:
 - `lennard_jones`
 - `NNP`
 - `NNP_csr`
+- `NNP_fixed`
 - `NNP_aoti`
 
 Supported ensembles:
@@ -160,7 +161,7 @@ the mass-weighted whole-system COM velocity after completed MD steps; it require
 
 `use_graph=true` enables CUDA Graph capture for graph-safe interactions. It is
 currently supported for Lennard-Jones interactions only. Use `use_graph=false`
-for `NNP`, `NNP_csr`, and `NNP_aoti`.
+for `NNP`, `NNP_csr`, `NNP_fixed`, and `NNP_aoti`.
 
 Supported observers include:
 
@@ -209,6 +210,14 @@ the observer is called every MD step.
 `NNP_csr` additionally passes:
 
 - `offsets`: `int64[N + 1]`
+
+`NNP_fixed` uses the ordinary three-input NNP model with fixed-capacity edge
+tensors.  Valid edges are followed by cutoff-zeroed padding edges, so the
+steady-state force loop avoids the per-step device-to-host edge-count copy.
+The first graph reports its edge count, and later capacity overflow fails on
+the CUDA stream before truncated forces can be integrated.  Calibrate with the
+ordinary `NNP` backend first and set `max_edges` above the reported maximum;
+20 percent headroom is recommended for NVT production.
 
 All NNP variants expect a tuple-like output:
 

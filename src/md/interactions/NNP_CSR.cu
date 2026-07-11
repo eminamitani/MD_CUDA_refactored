@@ -12,6 +12,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <utility>
+#include <cassert>
+#include <cstdio>
 
 namespace {
     __global__ void count_pairs_kernel(
@@ -109,6 +111,7 @@ namespace {
             const float dist_sq = dx * dx + dy * dy + dz * dz;
 
             if (dist_sq < cutoff * cutoff) {
+                if (write_idx >= num_max_edges) return;
                 edge_index_ptr[write_idx] = idx;
                 edge_index_ptr[num_max_edges + write_idx] = j;
 
@@ -148,6 +151,21 @@ namespace {
         edge_weight_ptr[pad_idx] = 1e+5f;
         edge_weight_ptr[num_max_edges + pad_idx] = 0.0f;
         edge_weight_ptr[2 * num_max_edges + pad_idx] = 0.0f;
+    }
+
+    __global__ void guard_edge_capacity_kernel(
+        const int64_t* total_edges,
+        const int num_max_edges
+    ) {
+        if (threadIdx.x != 0 || blockIdx.x != 0) return;
+        if (total_edges[0] > static_cast<int64_t>(num_max_edges)) {
+            printf(
+                "NNP_fixed edge capacity exceeded: edges=%lld max_edges=%d\n",
+                static_cast<long long>(total_edges[0]),
+                num_max_edges
+            );
+            assert(total_edges[0] <= static_cast<int64_t>(num_max_edges));
+        }
     }
     std::pair<torch::Tensor, torch::Tensor> unpack_nnp_csr_output(const c10::IValue& result, int num_atoms, const char* backend_name) {
         if (!result.isTuple()) {
@@ -191,8 +209,9 @@ NNP_CSR::NNP_CSR(
     NeighbourList* _nl, 
     float _cutoff, 
     int _num_max_edges, 
-    const std::string model_path
-) : cell(_cell), cutoff(_cutoff), nl(_nl), num_max_edges(_num_max_edges) {
+    const std::string model_path,
+    bool _fixed_shape_no_sync
+) : cell(_cell), cutoff(_cutoff), nl(_nl), num_max_edges(_num_max_edges), fixed_shape_no_sync(_fixed_shape_no_sync) {
     // モデルの読み込み
     try {
         model = torch::jit::load(model_path, torch::kCUDA);
@@ -294,16 +313,36 @@ void NNP_CSR::create_graph(State& state) {
     );
     MD_CUDA_KERNEL_CHECK();
 
-    int64_t h_num_edges = 0;
-    MD_CUDA_CHECK(cudaMemcpyAsync(&h_num_edges, offsets_ptr + N, sizeof(int64_t), cudaMemcpyDeviceToHost, state.stream));
-    MD_CUDA_CHECK(cudaStreamSynchronize(state.stream));
-    if (h_num_edges > num_max_edges) {
-        std::ostringstream oss;
-        oss << "NNP_CSR graph has " << h_num_edges << " edges, exceeding max_edges=" << num_max_edges
-            << ". Increase potentials.max_edges or reduce cutoff.";
-        throw std::runtime_error(oss.str());
+    if (fixed_shape_no_sync) {
+        if (!initial_edge_count_checked) {
+            int64_t h_num_edges = 0;
+            MD_CUDA_CHECK(cudaMemcpyAsync(&h_num_edges, offsets_ptr + N, sizeof(int64_t), cudaMemcpyDeviceToHost, state.stream));
+            MD_CUDA_CHECK(cudaStreamSynchronize(state.stream));
+            if (h_num_edges > num_max_edges) {
+                std::ostringstream oss;
+                oss << "NNP_fixed initial graph has " << h_num_edges << " edges, exceeding max_edges=" << num_max_edges
+                    << ". Increase potentials.max_edges or reduce cutoff.";
+                throw std::runtime_error(oss.str());
+            }
+            std::cout << "NNP_fixed initial edges=" << h_num_edges
+                      << ", max_edges=" << num_max_edges << std::endl;
+            initial_edge_count_checked = true;
+        }
+        guard_edge_capacity_kernel<<<1, 1, 0, state.stream>>>(offsets_ptr + N, num_max_edges);
+        MD_CUDA_KERNEL_CHECK();
+        num_edges = num_max_edges;
+    } else {
+        int64_t h_num_edges = 0;
+        MD_CUDA_CHECK(cudaMemcpyAsync(&h_num_edges, offsets_ptr + N, sizeof(int64_t), cudaMemcpyDeviceToHost, state.stream));
+        MD_CUDA_CHECK(cudaStreamSynchronize(state.stream));
+        if (h_num_edges > num_max_edges) {
+            std::ostringstream oss;
+            oss << "NNP_CSR graph has " << h_num_edges << " edges, exceeding max_edges=" << num_max_edges
+                << ". Increase potentials.max_edges or reduce cutoff.";
+            throw std::runtime_error(oss.str());
+        }
+        num_edges = static_cast<int>(h_num_edges);
     }
-    num_edges = static_cast<int>(h_num_edges);
 
     build_graph_kernel<<<num_blocks, num_threads, 0, state.stream>>>(
         state.pos, 
@@ -341,7 +380,9 @@ void NNP_CSR::calc_force(State& state) {
     c10::cuda::CUDAStream torch_stream = c10::cuda::getStreamFromExternal(state.stream, x.device().index());
     c10::cuda::CUDAStreamGuard guard(torch_stream);
 
-    auto result_iv = model.forward({x, edge_index, edge_weight, offsets});
+    auto result_iv = fixed_shape_no_sync
+        ? model.forward({x, edge_index, edge_weight})
+        : model.forward({x, edge_index, edge_weight, offsets});
     auto [energy, forces] = unpack_nnp_csr_output(result_iv, N, "NNP_CSR");
 
     // libtorch側のポインター
@@ -361,7 +402,9 @@ void NNP_CSR::calc_potential(State& state) {
     c10::cuda::CUDAStream torch_stream = c10::cuda::getStreamFromExternal(state.stream, x.device().index());
     c10::cuda::CUDAStreamGuard guard(torch_stream);
 
-    auto result_iv = model.forward({x, edge_index, edge_weight, offsets});
+    auto result_iv = fixed_shape_no_sync
+        ? model.forward({x, edge_index, edge_weight})
+        : model.forward({x, edge_index, edge_weight, offsets});
     auto [energy, forces] = unpack_nnp_csr_output(result_iv, state.n_atoms, "NNP_CSR");
 
     float* energy_ptr = energy.data_ptr<float>();
