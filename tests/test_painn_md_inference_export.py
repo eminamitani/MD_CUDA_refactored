@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SIMPLEGNN_ROOT = ROOT.parent / "simplegnn_version2"
+SIMPLEGNN_ROOT = Path(os.environ.get("SIMPLEGNN_ROOT", ROOT.parent / "simplegnn_version2"))
 TORCH_SPEC = importlib.util.find_spec("torch")
 
 if TORCH_SPEC is not None:
