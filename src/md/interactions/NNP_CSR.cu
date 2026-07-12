@@ -145,8 +145,12 @@ namespace {
 
         if (pad_idx >= num_max_edges) return;
 
-        edge_index_ptr[pad_idx] = 0;
-        edge_index_ptr[num_max_edges + pad_idx] = 0;
+        // Spread zero-contribution self edges across atoms. Sending every
+        // padding edge to atom 0 creates a severe scatter_add atomic hotspot
+        // in PaiNN even though the cutoff envelope makes each message zero.
+        const int padding_node = idx % num_nodes;
+        edge_index_ptr[pad_idx] = padding_node;
+        edge_index_ptr[num_max_edges + pad_idx] = padding_node;
 
         edge_weight_ptr[pad_idx] = 1e+5f;
         edge_weight_ptr[num_max_edges + pad_idx] = 0.0f;

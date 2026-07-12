@@ -255,6 +255,8 @@ the observer is called every MD step.
 `NNP_fixed` uses the ordinary three-input NNP model with fixed-capacity edge
 tensors.  Valid edges are followed by cutoff-zeroed padding edges, so the
 steady-state force loop avoids the per-step device-to-host edge-count copy.
+Padding self edges are distributed across atoms rather than all targeting atom
+zero, avoiding a `scatter_add` atomic hotspot while retaining zero contribution.
 The first graph reports its edge count, and later capacity overflow fails on
 the CUDA stream before truncated forces can be integrated.  Calibrate with the
 ordinary `NNP` backend first and set `max_edges` above the reported maximum;

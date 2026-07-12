@@ -81,6 +81,28 @@ class PainnMDInferenceExportTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(energy))
         self.assertTrue(torch.isfinite(forces).all())
 
+    def test_distributed_padding_has_zero_contribution(self) -> None:
+        optimized = PainnMDInferenceWrapper(self.base, self.baseline).eval()
+        reference_energy, reference_forces = optimized(
+            self.atomic_numbers,
+            self.edge_index,
+            self.edge_weight,
+        )
+
+        padding_count = 7
+        padding_nodes = torch.arange(padding_count, dtype=torch.long) % self.atomic_numbers.shape[0]
+        padding_edge_index = torch.stack((padding_nodes, padding_nodes), dim=0)
+        padding_edge_weight = torch.zeros((3, padding_count), dtype=torch.float32)
+        padding_edge_weight[0] = 1.0e5
+        padded_energy, padded_forces = optimized(
+            self.atomic_numbers,
+            torch.cat((self.edge_index, padding_edge_index), dim=1),
+            torch.cat((self.edge_weight, padding_edge_weight), dim=1),
+        )
+
+        self.assertLessEqual(float(torch.abs(reference_energy - padded_energy)), 1e-6)
+        self.assertLessEqual(float(torch.max(torch.abs(reference_forces - padded_forces))), 1e-6)
+
 
 if __name__ == "__main__":
     unittest.main()
