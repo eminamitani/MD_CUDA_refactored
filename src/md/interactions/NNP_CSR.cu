@@ -367,15 +367,17 @@ void NNP_CSR::create_graph(State& state) {
     );
     MD_CUDA_KERNEL_CHECK();
 
-    int num_blocks_edges = (num_max_edges + num_threads - 1) / num_threads;
-    padding_kernel<<<num_blocks_edges, num_threads, 0, state.stream>>>(
-        edge_index_ptr, 
-        edge_weight_ptr, 
-        offsets_ptr + N, 
-        N, 
-        num_max_edges
-    );
-    MD_CUDA_KERNEL_CHECK();
+    if (fixed_shape_no_sync) {
+        int num_blocks_edges = (num_max_edges + num_threads - 1) / num_threads;
+        padding_kernel<<<num_blocks_edges, num_threads, 0, state.stream>>>(
+            edge_index_ptr,
+            edge_weight_ptr,
+            offsets_ptr + N,
+            N,
+            num_max_edges
+        );
+        MD_CUDA_KERNEL_CHECK();
+    }
 }
 
 void NNP_CSR::calc_force(State& state) {
@@ -390,7 +392,12 @@ void NNP_CSR::calc_force(State& state) {
 
     auto result_iv = fixed_shape_no_sync
         ? model.forward({x, edge_index, edge_weight})
-        : model.forward({x, edge_index, edge_weight, offsets});
+        : model.forward({
+            x,
+            edge_index.narrow(1, 0, num_edges),
+            edge_weight.narrow(1, 0, num_edges),
+            offsets
+        });
     auto [energy, forces] = unpack_nnp_csr_output(result_iv, N, "NNP_CSR");
 
     // libtorch側のポインター
@@ -432,7 +439,12 @@ void NNP_CSR::calc_potential(State& state) {
 
     auto result_iv = fixed_shape_no_sync
         ? model.forward({x, edge_index, edge_weight})
-        : model.forward({x, edge_index, edge_weight, offsets});
+        : model.forward({
+            x,
+            edge_index.narrow(1, 0, num_edges),
+            edge_weight.narrow(1, 0, num_edges),
+            offsets
+        });
     auto [energy, forces] = unpack_nnp_csr_output(result_iv, state.n_atoms, "NNP_CSR");
 
     float* energy_ptr = energy.data_ptr<float>();

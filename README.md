@@ -248,11 +248,18 @@ the observer is called every MD step.
 - `edge_index`: `int64[2, E]`
 - `edge_weight`: `float32[3, E]` relative displacement vectors
 
-`NNP_csr` additionally passes:
+`NNP_csr` is the variable-shape MD CSR backend and additionally passes:
 
 - `offsets`: `int64[N + 1]`
 
-`NNP_fixed` uses the ordinary three-input NNP model with fixed-capacity edge
+Export a compatible four-input PaiNN artifact with
+`--forward-mode md --aggregation-mode csr`. Valid edges are grouped by source
+atom, and the exported wrapper uses CSR segment reductions for scalar and
+vector message aggregation. The runtime narrows edge tensors to the current
+edge count before each call, so unused capacity is not evaluated by PaiNN.
+
+`NNP_fixed` is retained as an experimental compatibility backend. It uses the
+ordinary three-input NNP model with fixed-capacity edge
 tensors.  Valid edges are followed by cutoff-zeroed padding edges, so the
 steady-state force loop avoids the per-step device-to-host edge-count copy.
 Padding self edges are distributed across atoms rather than all targeting atom
@@ -313,6 +320,11 @@ or regression checks.
 
 Then set the potential type to `NNP` and point `model_path` to the exported
 `.pt` file.
+
+For the variable-shape CSR path, add `--aggregation-mode csr` and set the
+potential type to `NNP_csr`. The default remains `--aggregation-mode scatter`
+with the ordinary three-input `NNP` backend. CSR aggregation is available only
+with `--forward-mode md`.
 
 ## Cell list
 

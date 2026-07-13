@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Export a simplegnn PaiNN checkpoint for the MD_CUDA_refactored NNP backend.
 
-The MD code calls TorchScript models as:
+The MD code calls ordinary TorchScript models as:
 
     model(x, edge_index, edge_weight)
 
@@ -14,7 +14,8 @@ The simplegnn PaiNN implementation uses:
 
 where `edge_weight` is `[E, 3]` and forces are returned as `[N, 3]`.
 This exporter wraps the trained model and saves a TorchScript module with the
-MD-compatible interface.
+MD-compatible interface. CSR exports additionally accept `offsets` with shape
+`[N + 1]` and use source-sorted segment reductions for PaiNN message updates.
 """
 
 from __future__ import annotations
@@ -144,6 +145,137 @@ class PainnMDInferenceWrapper(torch.nn.Module):
         return atom_energy.sum() + baseline, forces_soa
 
 
+class PainnMDCSRMessageLayer(torch.nn.Module):
+    """PaiNN message layer using CSR source segments instead of scatter_add."""
+
+    def __init__(self, base: torch.nn.Module):
+        super().__init__()
+        self.natom_basis = int(base.natom_basis)
+        self.radial = base.radial
+        self.envelope = base.envelope
+        self.interaction_context_network = base.interaction_context_network
+        self.filter_network = base.filter_network
+
+    def forward(
+        self,
+        node_scalar: Tensor,
+        node_vector: Tensor,
+        edge_index: Tensor,
+        edge_weight: Tensor,
+        offsets: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
+        context = self.interaction_context_network(node_scalar)
+        distances = torch.norm(edge_weight, dim=-1)
+        directions = edge_weight / distances.unsqueeze(-1)
+        basis = self.radial(distances)
+        cutoff = self.envelope(distances)
+        filters = self.filter_network(basis) * cutoff
+
+        index_j = edge_index[1]
+        context_j = context[index_j]
+        vector_j = node_vector[index_j]
+        messages = filters * context_j
+        delta_scalar, delta_radial, delta_vector = torch.split(
+            messages,
+            self.natom_basis,
+            dim=-1,
+        )
+
+        scalar_update = torch.segment_reduce(
+            delta_scalar,
+            "sum",
+            offsets=offsets,
+        )
+        delta_radial = delta_radial.unsqueeze(1)
+        delta_vector = delta_vector.unsqueeze(1)
+        vector_messages = (
+            delta_radial * directions[..., None]
+            + delta_vector * vector_j
+        )
+        vector_update = torch.segment_reduce(
+            vector_messages,
+            "sum",
+            offsets=offsets,
+        )
+        return node_scalar + scalar_update, node_vector + vector_update
+
+
+class PainnMDCSRInferenceWrapper(torch.nn.Module):
+    """MD-only PaiNN forward using a four-input CSR TorchScript ABI."""
+
+    def __init__(self, base: torch.nn.Module, e0_lookup: Tensor):
+        super().__init__()
+        self.embedding = base.embedding
+        self.message_layers = torch.nn.ModuleList(
+            [PainnMDCSRMessageLayer(message) for message in base.message_layers]
+        )
+        self.mixing_layers = base.mixing_layers
+        self.output = base.output
+        self.register_buffer("e0_lookup", e0_lookup)
+        for parameter in self.parameters():
+            parameter.requires_grad_(False)
+
+    def forward(
+        self,
+        Z: Tensor,
+        edge_index: Tensor,
+        edge_weight: Tensor,
+        offsets: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
+        if Z.dtype != torch.long:
+            Z = Z.long()
+        if edge_index.dtype != torch.long:
+            edge_index = edge_index.long()
+        if offsets.dtype != torch.long:
+            offsets = offsets.long()
+
+        edge_weight_e3 = edge_weight.transpose(0, 1).contiguous()
+        edge_weight_e3 = edge_weight_e3.detach().requires_grad_(True)
+
+        node_scalar = self.embedding(Z)
+        node_vector = torch.zeros(
+            (node_scalar.shape[0], 3, node_scalar.shape[1]),
+            dtype=node_scalar.dtype,
+            device=node_scalar.device,
+        )
+        for message, mixing in zip(self.message_layers, self.mixing_layers):
+            node_scalar, node_vector = message(
+                node_scalar,
+                node_vector,
+                edge_index,
+                edge_weight_e3,
+                offsets,
+            )
+            node_scalar, node_vector = mixing(node_scalar, node_vector)
+
+        atom_energy = self.output(node_scalar)
+        diff_energy = torch.autograd.grad(
+            [atom_energy.sum()],
+            [edge_weight_e3],
+            create_graph=True,
+        )[0]
+        assert diff_energy is not None
+        diff_energy = diff_energy.detach()
+
+        force_i = torch.segment_reduce(
+            diff_energy,
+            "sum",
+            offsets=offsets,
+        )
+        force_j = torch.zeros_like(force_i)
+        index_j = edge_index[1].unsqueeze(1)
+        force_j = torch.scatter_add(
+            force_j,
+            0,
+            index_j.expand_as(diff_energy),
+            -diff_energy,
+        )
+        forces_soa = (force_i + force_j).transpose(0, 1).contiguous()
+
+        baseline = self.e0_lookup[Z].to(dtype=atom_energy.dtype).sum()
+        return atom_energy.sum() + baseline, forces_soa
+
+
 def _torch_load(path: Path, device: torch.device) -> Any:
     try:
         return torch.load(path, map_location=device, weights_only=False)
@@ -216,6 +348,12 @@ def parse_args() -> argparse.Namespace:
         default="md",
         help="Use the MD-only inference path (default) or the legacy training forward path.",
     )
+    parser.add_argument(
+        "--aggregation-mode",
+        choices=("scatter", "csr"),
+        default="scatter",
+        help="Use ordinary scatter aggregation (default) or the four-input CSR MD ABI.",
+    )
     parser.add_argument("--natom-basis", type=int, default=60)
     parser.add_argument("--n-radial", type=int, default=40)
     parser.add_argument("--cutoff", type=float, default=5.0)
@@ -256,7 +394,11 @@ def main() -> int:
     base.to(device).eval()
 
     e0_lookup = _load_energy_baseline_lookup(args.energy_baseline_json).to(device)
-    if args.forward_mode == "md":
+    if args.aggregation_mode == "csr" and args.forward_mode != "md":
+        raise ValueError("--aggregation-mode csr requires --forward-mode md")
+    if args.aggregation_mode == "csr":
+        wrapper = PainnMDCSRInferenceWrapper(base, e0_lookup).to(device).eval()
+    elif args.forward_mode == "md":
         wrapper = PainnMDInferenceWrapper(base, e0_lookup).to(device).eval()
     else:
         wrapper = PainnMDNNPWrapper(base, e0_lookup).to(device).eval()
