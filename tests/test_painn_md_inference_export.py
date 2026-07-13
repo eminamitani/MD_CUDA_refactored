@@ -18,7 +18,11 @@ if TORCH_SPEC is not None:
     from simplegnn.painn import Painn
 
     sys.path.insert(0, str(ROOT / "scripts"))
-    from export_simplegnn_painn_for_md import PainnMDInferenceWrapper, PainnMDNNPWrapper
+    from export_simplegnn_painn_for_md import (
+        PainnMDCSRInferenceWrapper,
+        PainnMDInferenceWrapper,
+        PainnMDNNPWrapper,
+    )
 else:  # pragma: no cover - depends on the optional local ML runtime.
     torch = None
 
@@ -53,6 +57,15 @@ class PainnMDInferenceExportTests(unittest.TestCase):
         self.baseline[3] = 1.5
         self.baseline[8] = -0.5
 
+    def csr_graph(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        order = torch.argsort(self.edge_index[0], stable=True)
+        edge_index = self.edge_index[:, order]
+        edge_weight = self.edge_weight[:, order]
+        counts = torch.bincount(edge_index[0], minlength=self.atomic_numbers.shape[0])
+        offsets = torch.zeros(self.atomic_numbers.shape[0] + 1, dtype=torch.long)
+        offsets[1:] = torch.cumsum(counts, dim=0)
+        return edge_index, edge_weight, offsets
+
     def test_md_forward_matches_legacy_energy_and_forces(self) -> None:
         legacy = PainnMDNNPWrapper(self.base, self.baseline).eval()
         optimized = PainnMDInferenceWrapper(self.base, self.baseline).eval()
@@ -80,6 +93,59 @@ class PainnMDInferenceExportTests(unittest.TestCase):
         self.assertEqual(tuple(forces.shape), (3, 3))
         self.assertTrue(torch.isfinite(energy))
         self.assertTrue(torch.isfinite(forces).all())
+
+    def test_csr_forward_matches_scatter_energy_and_forces(self) -> None:
+        edge_index, edge_weight, offsets = self.csr_graph()
+        scatter = PainnMDInferenceWrapper(self.base, self.baseline).eval()
+        csr = PainnMDCSRInferenceWrapper(self.base, self.baseline).eval()
+
+        scatter_energy, scatter_forces = scatter(
+            self.atomic_numbers,
+            edge_index,
+            edge_weight,
+        )
+        csr_energy, csr_forces = csr(
+            self.atomic_numbers,
+            edge_index,
+            edge_weight,
+            offsets,
+        )
+
+        self.assertLessEqual(float(torch.abs(scatter_energy - csr_energy)), 1e-4)
+        self.assertLessEqual(float(torch.max(torch.abs(scatter_forces - csr_forces))), 1e-5)
+
+    def test_csr_forward_is_torchscript_compatible(self) -> None:
+        edge_index, edge_weight, offsets = self.csr_graph()
+        csr = PainnMDCSRInferenceWrapper(self.base, self.baseline).eval()
+        scripted = torch.jit.script(csr)
+        energy, forces = scripted(
+            self.atomic_numbers,
+            edge_index,
+            edge_weight,
+            offsets,
+        )
+
+        self.assertEqual(tuple(energy.shape), ())
+        self.assertEqual(tuple(forces.shape), (3, 3))
+        self.assertTrue(torch.isfinite(energy))
+        self.assertTrue(torch.isfinite(forces).all())
+
+    def test_csr_forward_supports_zero_neighbour_segments(self) -> None:
+        atomic_numbers = torch.tensor([3, 8, 14, 8], dtype=torch.long)
+        edge_index = torch.tensor([[0, 0, 2], [1, 2, 0]], dtype=torch.long)
+        edge_weight = torch.tensor(
+            [[1.2, 0.3, -0.3], [0.1, 1.1, -1.1], [0.2, -0.4, 0.4]],
+            dtype=torch.float32,
+        )
+        offsets = torch.tensor([0, 2, 2, 3, 3], dtype=torch.long)
+        scatter = PainnMDInferenceWrapper(self.base, self.baseline).eval()
+        csr = PainnMDCSRInferenceWrapper(self.base, self.baseline).eval()
+
+        scatter_energy, scatter_forces = scatter(atomic_numbers, edge_index, edge_weight)
+        csr_energy, csr_forces = csr(atomic_numbers, edge_index, edge_weight, offsets)
+
+        self.assertLessEqual(float(torch.abs(scatter_energy - csr_energy)), 1e-4)
+        self.assertLessEqual(float(torch.max(torch.abs(scatter_forces - csr_forces))), 1e-5)
 
     def test_distributed_padding_has_zero_contribution(self) -> None:
         optimized = PainnMDInferenceWrapper(self.base, self.baseline).eval()
