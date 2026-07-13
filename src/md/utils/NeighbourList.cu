@@ -188,8 +188,22 @@ void NeighbourList::throw_if_overflow(State& state, const char* context) {
     }
 
     int h_overflow_count = 0;
-    MD_CUDA_CHECK(cudaMemcpyAsync(&h_overflow_count, this->overflow_count, sizeof(int), cudaMemcpyDeviceToHost, state.stream));
+    enqueue_overflow_count_copy(state, &h_overflow_count);
     MD_CUDA_CHECK(cudaStreamSynchronize(state.stream));
+    validate_overflow_count(h_overflow_count, context);
+}
+
+void NeighbourList::enqueue_overflow_count_copy(State& state, int* host_count) const {
+    MD_CUDA_CHECK(cudaMemcpyAsync(
+        host_count,
+        this->overflow_count,
+        sizeof(int),
+        cudaMemcpyDeviceToHost,
+        state.stream
+    ));
+}
+
+void NeighbourList::validate_overflow_count(int h_overflow_count, const char* context) const {
     if (h_overflow_count > 0) {
         throw std::runtime_error(
             std::string("NeighbourList overflow in ") + context +
@@ -252,6 +266,11 @@ void NeighbourList::generate(State& state, Cell* cell) {
 }
 
 void NeighbourList::check(State& state, Cell* cell) {
+    check_deferred(state, cell);
+    throw_if_overflow(state, "check");
+}
+
+void NeighbourList::check_deferred(State& state, Cell* cell) {
     auto N = state.n_atoms;
     auto cutoff_margin = cutoff + margin;
     auto cutoff_margin_sq = cutoff_margin * cutoff_margin;
@@ -304,7 +323,5 @@ void NeighbourList::check(State& state, Cell* cell) {
         cell->d_lattice
     );
     MD_CUDA_KERNEL_CHECK();
-    throw_if_overflow(state, "check");
-
     MD_CUDA_CHECK(cudaMemsetAsync(this->flag, 0, sizeof(bool), state.stream));
 }

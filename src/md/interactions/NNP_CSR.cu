@@ -337,8 +337,11 @@ void NNP_CSR::create_graph(State& state) {
         num_edges = num_max_edges;
     } else {
         int64_t h_num_edges = 0;
+        int neighbour_overflow_count = 0;
         MD_CUDA_CHECK(cudaMemcpyAsync(&h_num_edges, offsets_ptr + N, sizeof(int64_t), cudaMemcpyDeviceToHost, state.stream));
+        nl->enqueue_overflow_count_copy(state, &neighbour_overflow_count);
         MD_CUDA_CHECK(cudaStreamSynchronize(state.stream));
+        nl->validate_overflow_count(neighbour_overflow_count, "NNP_CSR graph update");
         if (h_num_edges > num_max_edges) {
             std::ostringstream oss;
             oss << "NNP_CSR graph has " << h_num_edges << " edges, exceeding max_edges=" << num_max_edges
@@ -377,7 +380,8 @@ void NNP_CSR::create_graph(State& state) {
 
 void NNP_CSR::calc_force(State& state) {
     int N = state.n_atoms;
-    nl->check(state, cell);
+    if (fixed_shape_no_sync) nl->check(state, cell);
+    else nl->check_deferred(state, cell);
     create_graph(state);
 
     // ストリームを指定
@@ -403,9 +407,7 @@ void NNP_CSR::calc_force(State& state) {
     state.cached_potential_energy_valid = true;
 
     // 値のコピー
-    MD_CUDA_CHECK(cudaMemcpyAsync(state.force.x, forces_ptr, N * sizeof(float), cudaMemcpyDeviceToDevice, state.stream));
-    MD_CUDA_CHECK(cudaMemcpyAsync(state.force.y, forces_ptr + N, N * sizeof(float), cudaMemcpyDeviceToDevice, state.stream));
-    MD_CUDA_CHECK(cudaMemcpyAsync(state.force.z, forces_ptr + 2 * N, N * sizeof(float), cudaMemcpyDeviceToDevice, state.stream));
+    MD_CUDA_CHECK(cudaMemcpyAsync(state.force.x, forces_ptr, 3 * N * sizeof(float), cudaMemcpyDeviceToDevice, state.stream));
 }
 
 void NNP_CSR::calc_potential(State& state) {
@@ -420,7 +422,8 @@ void NNP_CSR::calc_potential(State& state) {
         MD_CUDA_CHECK(cudaStreamSynchronize(state.stream));
         return;
     }
-    nl->check(state, cell);
+    if (fixed_shape_no_sync) nl->check(state, cell);
+    else nl->check_deferred(state, cell);
     create_graph(state);
 
     // ストリームを指定

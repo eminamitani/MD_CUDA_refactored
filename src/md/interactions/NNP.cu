@@ -242,11 +242,13 @@ void NNP::create_graph(State& state) {
         offsets
     );
 
-    int last_count, last_offset;
+    int last_count, last_offset, neighbour_overflow_count;
     MD_CUDA_CHECK(cudaMemcpyAsync(&last_count, counts + N - 1, sizeof(int), cudaMemcpyDeviceToHost, state.stream));
     MD_CUDA_CHECK(cudaMemcpyAsync(&last_offset, offsets + N - 1, sizeof(int), cudaMemcpyDeviceToHost, state.stream));
+    nl->enqueue_overflow_count_copy(state, &neighbour_overflow_count);
 
     MD_CUDA_CHECK(cudaStreamSynchronize(state.stream));
+    nl->validate_overflow_count(neighbour_overflow_count, "NNP graph update");
 
     int num_pairs = last_offset + last_count;
     num_edges = 2 * num_pairs;
@@ -286,7 +288,7 @@ void NNP::create_graph(State& state) {
 
 void NNP::calc_force(State& state) {
     int N = state.n_atoms;
-    nl->check(state, cell);
+    nl->check_deferred(state, cell);
     create_graph(state);
 
     auto opt = torch::TensorOptions().device(torch::kCUDA);
@@ -316,9 +318,7 @@ void NNP::calc_force(State& state) {
     state.cached_potential_energy_valid = true;
 
     // 値のコピー
-    MD_CUDA_CHECK(cudaMemcpyAsync(state.force.x, forces_ptr, N * sizeof(float), cudaMemcpyDeviceToDevice, state.stream));
-    MD_CUDA_CHECK(cudaMemcpyAsync(state.force.y, forces_ptr + N, N * sizeof(float), cudaMemcpyDeviceToDevice, state.stream));
-    MD_CUDA_CHECK(cudaMemcpyAsync(state.force.z, forces_ptr + 2 * N, N * sizeof(float), cudaMemcpyDeviceToDevice, state.stream));
+    MD_CUDA_CHECK(cudaMemcpyAsync(state.force.x, forces_ptr, 3 * N * sizeof(float), cudaMemcpyDeviceToDevice, state.stream));
 }
 
 void NNP::calc_potential(State& state) {
@@ -333,7 +333,7 @@ void NNP::calc_potential(State& state) {
         MD_CUDA_CHECK(cudaStreamSynchronize(state.stream));
         return;
     }
-    nl->check(state, cell);
+    nl->check_deferred(state, cell);
     create_graph(state);
 
     int N = state.n_atoms;

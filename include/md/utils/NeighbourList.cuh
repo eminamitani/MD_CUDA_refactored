@@ -22,6 +22,9 @@ namespace md {
 
             void generate(State& state, Cell* cell);
             void check(State& state, Cell* cell);
+            void check_deferred(State& state, Cell* cell);
+            void enqueue_overflow_count_copy(State& state, int* host_count) const;
+            void validate_overflow_count(int overflow_count, const char* context) const;
 
             int* get_list() { return this->list; }
             int* get_count() { return this->count; }
