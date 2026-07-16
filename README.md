@@ -269,6 +269,16 @@ the CUDA stream before truncated forces can be integrated.  Calibrate with the
 ordinary `NNP` backend first and set `max_edges` above the reported maximum;
 20 percent headroom is recommended for NVT production.
 
+The PaiNN exporter also contains opt-in research paths for shared geometry and
+MD_CUDA paired-edge folding (`--geometry-mode shared` and
+`--edge-layout md_cuda_paired`).  They preserve the existing three-input
+TorchScript ABI, but are not production backends: the Gen6 production400
+checkpoint exceeds the strict `1e-5 eV/Angstrom` maximum-force parity gate for
+both paths.  `scripts/validate_painn_paired_parity.py` records the gate result,
+and `scripts/benchmark_painn_compile_feasibility.py` stops before compilation
+when the functional AOTAutograd force path fails the same gate.  The default
+directed, per-layer MD export remains unchanged.
+
 All NNP variants expect a tuple-like output:
 
 ```text

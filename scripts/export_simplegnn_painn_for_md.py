@@ -954,11 +954,6 @@ def parse_args() -> argparse.Namespace:
         help="Evaluate filter linears per layer or as one stacked projection.",
     )
     parser.add_argument(
-        "--artifact-format",
-        choices=("torchscript", "aoti"),
-        default="torchscript",
-    )
-    parser.add_argument(
         "--force-output",
         choices=("atom", "pair_gradient"),
         default="atom",
@@ -1020,8 +1015,6 @@ def main() -> int:
         raise ValueError("--filter-projection stacked requires --geometry-mode shared")
     if args.force_output == "pair_gradient" and args.edge_layout != "md_cuda_paired":
         raise ValueError("--force-output pair_gradient requires --edge-layout md_cuda_paired")
-    if args.artifact_format == "aoti":
-        raise ValueError("AOTI export requires the Hydra feasibility gate and is not enabled yet")
     if args.aggregation_mode == "csr":
         wrapper = PainnMDCSRInferenceWrapper(base, e0_lookup).to(device).eval()
     elif args.edge_layout == "md_cuda_paired":

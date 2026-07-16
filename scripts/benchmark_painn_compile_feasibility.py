@@ -90,6 +90,20 @@ def main() -> int:
             torch.max(torch.abs(eager_forces - functional_forces))
         ),
     }
+    functional_parity_pass = bool(
+        result["functional_energy_difference_ev"] <= 1e-4
+        and result["functional_max_force_difference_ev_a"] <= 1e-5
+    )
+    result["functional_strict_parity_pass"] = functional_parity_pass
+    if not functional_parity_pass:
+        result["status"] = "parity_fail"
+        rendered = json.dumps(result, indent=2, sort_keys=True) + "\n"
+        if args.output is not None:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(rendered, encoding="utf-8")
+        print(rendered, end="")
+        return 1
+
     try:
         started = time.monotonic()
         compiled = torch.compile(functional, fullgraph=True, dynamic=True)
