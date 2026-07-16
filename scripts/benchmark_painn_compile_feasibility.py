@@ -12,6 +12,7 @@ from pathlib import Path
 import torch
 
 from export_simplegnn_painn_for_md import (
+    PainnMDFunctionalInferenceWrapper,
     PainnMDInferenceWrapper,
     _extract_state_dict,
     _load_energy_baseline_lookup,
@@ -70,25 +71,34 @@ def main() -> int:
     base.to(device).eval()
     baseline = _load_energy_baseline_lookup(args.energy_baseline_json).to(device)
     wrapper = PainnMDInferenceWrapper(base, baseline).to(device).eval()
+    functional = PainnMDFunctionalInferenceWrapper(base, baseline).to(device).eval()
 
     z, edge_index, edge_weight = read_paired_graph(args.xyz, args.max_atoms, args.cutoff)
     inputs = (z.to(device), edge_index.to(device), edge_weight.to(device))
     eager_energy, eager_forces = wrapper(*inputs)
+    functional_energy, functional_forces = functional(*inputs)
 
     result: dict[str, object] = {
         "torch_version": torch.__version__,
         "atoms": int(z.shape[0]),
         "edges": int(edge_index.shape[1]),
         "status": "fail",
+        "functional_energy_difference_ev": float(
+            torch.abs(eager_energy - functional_energy)
+        ),
+        "functional_max_force_difference_ev_a": float(
+            torch.max(torch.abs(eager_forces - functional_forces))
+        ),
     }
     try:
         started = time.monotonic()
-        compiled = torch.compile(wrapper, fullgraph=True, dynamic=True)
+        compiled = torch.compile(functional, fullgraph=True, dynamic=True)
         compiled_energy, compiled_forces = compiled(*inputs)
         compile_seconds = time.monotonic() - started
         energy_difference = float(torch.abs(eager_energy - compiled_energy))
         force_difference = float(torch.max(torch.abs(eager_forces - compiled_forces)))
         eager_ms = elapsed_ms(wrapper, inputs, args.steps)
+        functional_ms = elapsed_ms(functional, inputs, args.steps)
         compiled_ms = elapsed_ms(compiled, inputs, args.steps)
         result.update(
             {
@@ -97,6 +107,7 @@ def main() -> int:
                 "energy_difference_ev": energy_difference,
                 "max_force_difference_ev_a": force_difference,
                 "eager_ms_per_call": eager_ms,
+                "functional_ms_per_call": functional_ms,
                 "compiled_ms_per_call": compiled_ms,
                 "speedup": eager_ms / compiled_ms,
                 "strict_parity_pass": energy_difference <= 1e-4

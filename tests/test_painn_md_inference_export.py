@@ -19,6 +19,7 @@ if TORCH_SPEC is not None:
 
     sys.path.insert(0, str(ROOT / "scripts"))
     from export_simplegnn_painn_for_md import (
+        PainnMDFunctionalInferenceWrapper,
         PainnMDCSRInferenceWrapper,
         PainnMDInferenceWrapper,
         PainnMDNNPWrapper,
@@ -102,6 +103,25 @@ class PainnMDInferenceExportTests(unittest.TestCase):
         self.assertEqual(tuple(forces.shape), (3, 3))
         self.assertTrue(torch.isfinite(energy))
         self.assertTrue(torch.isfinite(forces).all())
+
+    def test_functional_forward_matches_md_forward(self) -> None:
+        directed = PainnMDInferenceWrapper(self.base, self.baseline).eval()
+        functional = PainnMDFunctionalInferenceWrapper(self.base, self.baseline).eval()
+        directed_energy, directed_forces = directed(
+            self.atomic_numbers,
+            self.edge_index,
+            self.edge_weight,
+        )
+        functional_energy, functional_forces = functional(
+            self.atomic_numbers,
+            self.edge_index,
+            self.edge_weight,
+        )
+        self.assertLessEqual(float(torch.abs(directed_energy - functional_energy)), 1e-4)
+        self.assertLessEqual(
+            float(torch.max(torch.abs(directed_forces - functional_forces))),
+            1e-5,
+        )
 
     def test_paired_shared_matches_directed_energy_and_forces(self) -> None:
         edge_index, edge_weight = self.paired_graph()

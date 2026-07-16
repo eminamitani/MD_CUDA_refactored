@@ -146,6 +146,86 @@ class PainnMDInferenceWrapper(torch.nn.Module):
         return atom_energy.sum() + baseline, forces_soa
 
 
+class PainnMDEnergyModule(torch.nn.Module):
+    """Pure directed-edge PaiNN energy graph for functional differentiation."""
+
+    def __init__(self, base: torch.nn.Module, e0_lookup: Tensor):
+        super().__init__()
+        self.embedding = base.embedding
+        self.message_layers = base.message_layers
+        self.mixing_layers = base.mixing_layers
+        self.output = base.output
+        self.register_buffer("e0_lookup", e0_lookup)
+        for parameter in self.parameters():
+            parameter.requires_grad_(False)
+
+    def forward(self, Z: Tensor, edge_index: Tensor, edge_weight_e3: Tensor) -> Tensor:
+        node_scalar = self.embedding(Z)
+        node_vector = torch.zeros(
+            (node_scalar.shape[0], 3, node_scalar.shape[1]),
+            dtype=node_scalar.dtype,
+            device=node_scalar.device,
+        )
+        for message, mixing in zip(self.message_layers, self.mixing_layers):
+            node_scalar, node_vector = message(
+                node_scalar,
+                node_vector,
+                edge_index,
+                edge_weight_e3,
+            )
+            node_scalar, node_vector = mixing(node_scalar, node_vector)
+        atom_energy = self.output(node_scalar)
+        baseline = self.e0_lookup[Z].to(dtype=atom_energy.dtype).sum()
+        return atom_energy.sum() + baseline
+
+
+class PainnMDFunctionalInferenceWrapper(torch.nn.Module):
+    """AOTAutograd-friendly energy/force wrapper using a pure energy graph."""
+
+    def __init__(self, base: torch.nn.Module, e0_lookup: Tensor):
+        super().__init__()
+        self.energy_module = PainnMDEnergyModule(base, e0_lookup)
+
+    def forward(
+        self,
+        Z: Tensor,
+        edge_index: Tensor,
+        edge_weight: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
+        if Z.dtype != torch.long:
+            Z = Z.long()
+        if edge_index.dtype != torch.long:
+            edge_index = edge_index.long()
+        edge_weight_e3 = edge_weight.transpose(0, 1).contiguous()
+        edge_gradient, total_energy = torch.func.grad_and_value(
+            self.energy_module,
+            argnums=2,
+        )(Z, edge_index, edge_weight_e3)
+
+        index_i = edge_index[0]
+        index_j = edge_index[1]
+        atom_forces_i = torch.zeros(
+            (Z.shape[0], 3),
+            dtype=edge_gradient.dtype,
+            device=edge_gradient.device,
+        )
+        atom_forces_j = torch.zeros_like(atom_forces_i)
+        atom_forces_i = torch.scatter_add(
+            atom_forces_i,
+            0,
+            index_i.unsqueeze(1).expand_as(edge_gradient),
+            edge_gradient,
+        )
+        atom_forces_j = torch.scatter_add(
+            atom_forces_j,
+            0,
+            index_j.unsqueeze(1).expand_as(edge_gradient),
+            -edge_gradient,
+        )
+        atom_forces = atom_forces_i + atom_forces_j
+        return total_energy, atom_forces.transpose(0, 1).contiguous()
+
+
 class PainnMDPairedMessageLayer(torch.nn.Module):
     """Trained PaiNN message components used by the paired MD wrapper."""
 
