@@ -22,6 +22,8 @@ if TORCH_SPEC is not None:
         PainnMDCSRInferenceWrapper,
         PainnMDInferenceWrapper,
         PainnMDNNPWrapper,
+        PainnMDPairedInferenceWrapper,
+        _validate_shared_geometry,
     )
 else:  # pragma: no cover - depends on the optional local ML runtime.
     torch = None
@@ -66,6 +68,12 @@ class PainnMDInferenceExportTests(unittest.TestCase):
         offsets[1:] = torch.cumsum(counts, dim=0)
         return edge_index, edge_weight, offsets
 
+    def paired_graph(self) -> tuple[torch.Tensor, torch.Tensor]:
+        forward = torch.tensor([0, 2, 4], dtype=torch.long)
+        reverse = torch.tensor([1, 3, 5], dtype=torch.long)
+        order = torch.cat((forward, reverse))
+        return self.edge_index[:, order], self.edge_weight[:, order]
+
     def test_md_forward_matches_legacy_energy_and_forces(self) -> None:
         legacy = PainnMDNNPWrapper(self.base, self.baseline).eval()
         optimized = PainnMDInferenceWrapper(self.base, self.baseline).eval()
@@ -93,6 +101,123 @@ class PainnMDInferenceExportTests(unittest.TestCase):
         self.assertEqual(tuple(forces.shape), (3, 3))
         self.assertTrue(torch.isfinite(energy))
         self.assertTrue(torch.isfinite(forces).all())
+
+    def test_paired_shared_matches_directed_energy_and_forces(self) -> None:
+        edge_index, edge_weight = self.paired_graph()
+        directed = PainnMDInferenceWrapper(self.base, self.baseline).eval()
+        paired = PainnMDPairedInferenceWrapper(
+            self.base,
+            self.baseline,
+            validate_layout=True,
+        ).eval()
+
+        directed_energy, directed_forces = directed(
+            self.atomic_numbers,
+            edge_index,
+            edge_weight,
+        )
+        paired_energy, paired_forces = paired(
+            self.atomic_numbers,
+            edge_index,
+            edge_weight,
+        )
+
+        self.assertLessEqual(float(torch.abs(directed_energy - paired_energy)), 1e-4)
+        self.assertLessEqual(float(torch.max(torch.abs(directed_forces - paired_forces))), 1e-5)
+
+    def test_paired_stacked_filters_match_per_layer(self) -> None:
+        edge_index, edge_weight = self.paired_graph()
+        per_layer = PainnMDPairedInferenceWrapper(
+            self.base,
+            self.baseline,
+        ).eval()
+        stacked = PainnMDPairedInferenceWrapper(
+            self.base,
+            self.baseline,
+            stacked_filters=True,
+        ).eval()
+
+        reference_energy, reference_forces = per_layer(
+            self.atomic_numbers,
+            edge_index,
+            edge_weight,
+        )
+        stacked_energy, stacked_forces = stacked(
+            self.atomic_numbers,
+            edge_index,
+            edge_weight,
+        )
+
+        self.assertLessEqual(float(torch.abs(reference_energy - stacked_energy)), 1e-4)
+        self.assertLessEqual(float(torch.max(torch.abs(reference_forces - stacked_forces))), 1e-5)
+
+    def test_paired_pair_gradient_reconstructs_atom_forces(self) -> None:
+        edge_index, edge_weight = self.paired_graph()
+        atom_wrapper = PainnMDPairedInferenceWrapper(
+            self.base,
+            self.baseline,
+        ).eval()
+        gradient_wrapper = PainnMDPairedInferenceWrapper(
+            self.base,
+            self.baseline,
+            return_pair_gradient=True,
+        ).eval()
+
+        atom_energy, atom_forces = atom_wrapper(
+            self.atomic_numbers,
+            edge_index,
+            edge_weight,
+        )
+        gradient_energy, pair_gradient = gradient_wrapper(
+            self.atomic_numbers,
+            edge_index,
+            edge_weight,
+        )
+        pair_index = edge_index[:, : edge_index.shape[1] // 2]
+        reconstructed = torch.zeros((self.atomic_numbers.shape[0], 3))
+        reconstructed.index_add_(0, pair_index[0], pair_gradient.transpose(0, 1))
+        reconstructed.index_add_(0, pair_index[1], -pair_gradient.transpose(0, 1))
+
+        self.assertLessEqual(float(torch.abs(atom_energy - gradient_energy)), 1e-4)
+        self.assertLessEqual(
+            float(torch.max(torch.abs(atom_forces - reconstructed.transpose(0, 1)))),
+            1e-5,
+        )
+
+    def test_paired_forward_is_torchscript_compatible(self) -> None:
+        edge_index, edge_weight = self.paired_graph()
+        paired = PainnMDPairedInferenceWrapper(self.base, self.baseline).eval()
+        scripted = torch.jit.script(paired)
+        energy, forces = scripted(self.atomic_numbers, edge_index, edge_weight)
+
+        self.assertEqual(tuple(energy.shape), ())
+        self.assertEqual(tuple(forces.shape), (3, 3))
+        self.assertTrue(torch.isfinite(energy))
+        self.assertTrue(torch.isfinite(forces).all())
+
+    def test_paired_layout_validation_rejects_malformed_reverse_edges(self) -> None:
+        edge_index, edge_weight = self.paired_graph()
+        edge_weight = edge_weight.clone()
+        edge_weight[0, -1] += 0.25
+        paired = PainnMDPairedInferenceWrapper(
+            self.base,
+            self.baseline,
+            validate_layout=True,
+        ).eval()
+        with self.assertRaisesRegex(RuntimeError, "reverse displacements"):
+            paired(self.atomic_numbers, edge_index, edge_weight)
+
+    def test_paired_layout_rejects_odd_edge_count(self) -> None:
+        edge_index, edge_weight = self.paired_graph()
+        paired = PainnMDPairedInferenceWrapper(self.base, self.baseline).eval()
+        with self.assertRaisesRegex(RuntimeError, "even edge count"):
+            paired(self.atomic_numbers, edge_index[:, :-1], edge_weight[:, :-1])
+
+    def test_shared_geometry_validation_rejects_different_radial_buffer(self) -> None:
+        with torch.no_grad():
+            self.base.message_layers[1].radial.offsets[0] += 0.1
+        with self.assertRaisesRegex(ValueError, "radial buffer"):
+            _validate_shared_geometry(self.base)
 
     def test_csr_forward_matches_scatter_energy_and_forces(self) -> None:
         edge_index, edge_weight, offsets = self.csr_graph()

@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 
@@ -143,6 +144,193 @@ class PainnMDInferenceWrapper(torch.nn.Module):
 
         baseline = self.e0_lookup[Z].to(dtype=atom_energy.dtype).sum()
         return atom_energy.sum() + baseline, forces_soa
+
+
+class PainnMDPairedMessageLayer(torch.nn.Module):
+    """Trained PaiNN message components used by the paired MD wrapper."""
+
+    def __init__(self, base: torch.nn.Module):
+        super().__init__()
+        self.natom_basis = int(base.natom_basis)
+        self.interaction_context_network = base.interaction_context_network
+        self.filter_network = base.filter_network
+
+
+class PainnMDPairedInferenceWrapper(torch.nn.Module):
+    """MD-only PaiNN wrapper that folds MD_CUDA reverse edges into pairs.
+
+    MD_CUDA's ordinary NNP graph stores all forward pairs in the first half and
+    their index-reversed, displacement-negated copies in the second half.  The
+    wrapper evaluates geometry and radial filters only for the first half and
+    reconstructs both directed PaiNN messages from each undirected pair.
+    """
+
+    def __init__(
+        self,
+        base: torch.nn.Module,
+        e0_lookup: Tensor,
+        stacked_filters: bool = False,
+        return_pair_gradient: bool = False,
+        validate_layout: bool = False,
+    ):
+        super().__init__()
+        if len(base.message_layers) == 0:
+            raise ValueError("paired PaiNN export requires at least one message layer")
+        self.embedding = base.embedding
+        self.radial = base.message_layers[0].radial
+        self.envelope = base.message_layers[0].envelope
+        self.message_layers = torch.nn.ModuleList(
+            [PainnMDPairedMessageLayer(message) for message in base.message_layers]
+        )
+        self.mixing_layers = base.mixing_layers
+        self.output = base.output
+        self.stacked_filters = bool(stacked_filters)
+        self.return_pair_gradient = bool(return_pair_gradient)
+        self.validate_layout = bool(validate_layout)
+        self.num_interactions = len(base.message_layers)
+        self.natom_basis = int(base.message_layers[0].natom_basis)
+        self.register_buffer("e0_lookup", e0_lookup)
+
+        filter_weights = []
+        filter_biases = []
+        for message in base.message_layers:
+            linear = message.filter_network[0]
+            if not isinstance(linear, torch.nn.Linear):
+                raise TypeError("stacked filter export requires a Linear filter network")
+            if linear.bias is None:
+                raise ValueError("stacked filter export requires filter biases")
+            filter_weights.append(linear.weight.detach().clone())
+            filter_biases.append(linear.bias.detach().clone())
+        self.register_buffer("stacked_filter_weight", torch.cat(filter_weights, dim=0))
+        self.register_buffer("stacked_filter_bias", torch.cat(filter_biases, dim=0))
+
+        for parameter in self.parameters():
+            parameter.requires_grad_(False)
+
+    def forward(
+        self,
+        Z: Tensor,
+        edge_index: Tensor,
+        edge_weight: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
+        if Z.dtype != torch.long:
+            Z = Z.long()
+        if edge_index.dtype != torch.long:
+            edge_index = edge_index.long()
+        edge_count = edge_index.shape[1]
+        if edge_count % 2 != 0:
+            raise RuntimeError("md_cuda_paired edge layout requires an even edge count")
+
+        pair_count = edge_count // 2
+        pair_index = edge_index[:, :pair_count]
+        pair_weight = edge_weight[:, :pair_count]
+        if self.validate_layout:
+            reverse_index = edge_index[:, pair_count:]
+            reverse_weight = edge_weight[:, pair_count:]
+            if not torch.equal(reverse_index[0], pair_index[1]):
+                raise RuntimeError("md_cuda_paired reverse sources do not match")
+            if not torch.equal(reverse_index[1], pair_index[0]):
+                raise RuntimeError("md_cuda_paired reverse destinations do not match")
+            if not torch.equal(reverse_weight, -pair_weight):
+                raise RuntimeError("md_cuda_paired reverse displacements do not match")
+        pair_weight_e3 = pair_weight.transpose(0, 1).contiguous()
+        pair_weight_e3 = pair_weight_e3.detach().requires_grad_(True)
+
+        index_i = pair_index[0]
+        index_j = pair_index[1]
+        distances = torch.norm(pair_weight_e3, dim=-1)
+        directions = pair_weight_e3 / distances.unsqueeze(-1)
+        basis = self.radial(distances)
+        cutoff = self.envelope(distances)
+
+        if self.stacked_filters:
+            stacked = F.linear(
+                basis,
+                self.stacked_filter_weight,
+                self.stacked_filter_bias,
+            )
+            stacked = stacked.reshape(
+                pair_count,
+                self.num_interactions,
+                3 * self.natom_basis,
+            )
+        else:
+            stacked = torch.empty(
+                (pair_count, 0, 0),
+                dtype=basis.dtype,
+                device=basis.device,
+            )
+
+        node_scalar = self.embedding(Z)
+        node_vector = torch.zeros(
+            (node_scalar.shape[0], 3, node_scalar.shape[1]),
+            dtype=node_scalar.dtype,
+            device=node_scalar.device,
+        )
+        layer_index = 0
+        for message, mixing in zip(self.message_layers, self.mixing_layers):
+            context = message.interaction_context_network(node_scalar)
+            if self.stacked_filters:
+                filters = stacked[:, layer_index, :] * cutoff
+            else:
+                filters = message.filter_network(basis) * cutoff
+
+            messages_i = filters * context[index_j]
+            messages_j = filters * context[index_i]
+            scalar_i, radial_i, vector_i = torch.split(
+                messages_i,
+                message.natom_basis,
+                dim=-1,
+            )
+            scalar_j, radial_j, vector_j = torch.split(
+                messages_j,
+                message.natom_basis,
+                dim=-1,
+            )
+
+            scalar_update = torch.zeros_like(node_scalar)
+            scalar_update = torch.index_add(scalar_update, 0, index_i, scalar_i)
+            scalar_update = torch.index_add(scalar_update, 0, index_j, scalar_j)
+
+            pair_vector_i = (
+                radial_i.unsqueeze(1) * directions[..., None]
+                + vector_i.unsqueeze(1) * node_vector[index_j]
+            )
+            pair_vector_j = (
+                -radial_j.unsqueeze(1) * directions[..., None]
+                + vector_j.unsqueeze(1) * node_vector[index_i]
+            )
+            vector_update = torch.zeros_like(node_vector)
+            vector_update = torch.index_add(vector_update, 0, index_i, pair_vector_i)
+            vector_update = torch.index_add(vector_update, 0, index_j, pair_vector_j)
+
+            node_scalar = node_scalar + scalar_update
+            node_vector = node_vector + vector_update
+            node_scalar, node_vector = mixing(node_scalar, node_vector)
+            layer_index += 1
+
+        atom_energy = self.output(node_scalar)
+        pair_gradient = torch.autograd.grad(
+            [atom_energy.sum()],
+            [pair_weight_e3],
+            create_graph=True,
+        )[0]
+        assert pair_gradient is not None
+        pair_gradient = pair_gradient.detach()
+
+        baseline = self.e0_lookup[Z].to(dtype=atom_energy.dtype).sum()
+        total_energy = atom_energy.sum() + baseline
+        if self.return_pair_gradient:
+            return total_energy, pair_gradient.transpose(0, 1).contiguous()
+
+        atom_forces = torch.zeros(
+            (node_scalar.shape[0], 3),
+            dtype=atom_energy.dtype,
+            device=atom_energy.device,
+        )
+        atom_forces = torch.index_add(atom_forces, 0, index_i, pair_gradient)
+        atom_forces = torch.index_add(atom_forces, 0, index_j, -pair_gradient)
+        return total_energy, atom_forces.transpose(0, 1).contiguous()
 
 
 class PainnMDCSRMessageLayer(torch.nn.Module):
@@ -308,6 +496,39 @@ def _parse_radial_kwargs(raw: str) -> dict[str, Any]:
     return parsed
 
 
+def _validate_shared_geometry(base: torch.nn.Module) -> None:
+    """Require every interaction layer to use identical geometry modules."""
+
+    if len(base.message_layers) == 0:
+        raise ValueError("shared geometry requires at least one message layer")
+    reference = base.message_layers[0]
+    for layer_index, message in enumerate(base.message_layers[1:], start=1):
+        if type(message.radial) is not type(reference.radial):
+            raise ValueError(f"message layer {layer_index} has a different radial type")
+        if type(message.envelope) is not type(reference.envelope):
+            raise ValueError(f"message layer {layer_index} has a different envelope type")
+        if float(message.cutoff) != float(reference.cutoff):
+            raise ValueError(f"message layer {layer_index} has a different cutoff")
+        reference_radial = reference.radial.state_dict()
+        candidate_radial = message.radial.state_dict()
+        if reference_radial.keys() != candidate_radial.keys():
+            raise ValueError(f"message layer {layer_index} has different radial buffers")
+        for name, value in reference_radial.items():
+            if not torch.equal(value, candidate_radial[name]):
+                raise ValueError(
+                    f"message layer {layer_index} radial buffer {name!r} differs"
+                )
+        reference_envelope = reference.envelope.state_dict()
+        candidate_envelope = message.envelope.state_dict()
+        if reference_envelope.keys() != candidate_envelope.keys():
+            raise ValueError(f"message layer {layer_index} has different envelope buffers")
+        for name, value in reference_envelope.items():
+            if not torch.equal(value, candidate_envelope[name]):
+                raise ValueError(
+                    f"message layer {layer_index} envelope buffer {name!r} differs"
+                )
+
+
 def _load_energy_baseline_lookup(path: Path | None) -> Tensor:
     lookup_size = 119
     if path is None:
@@ -354,6 +575,39 @@ def parse_args() -> argparse.Namespace:
         default="scatter",
         help="Use ordinary scatter aggregation (default) or the four-input CSR MD ABI.",
     )
+    parser.add_argument(
+        "--edge-layout",
+        choices=("directed", "md_cuda_paired"),
+        default="directed",
+        help="Use ordinary directed edges or fold MD_CUDA's paired reverse-edge layout.",
+    )
+    parser.add_argument(
+        "--geometry-mode",
+        choices=("per_layer", "shared"),
+        default="per_layer",
+        help="Evaluate geometry per message layer or share it across paired message layers.",
+    )
+    parser.add_argument(
+        "--filter-projection",
+        choices=("per_layer", "stacked"),
+        default="per_layer",
+        help="Evaluate filter linears per layer or as one stacked projection.",
+    )
+    parser.add_argument(
+        "--artifact-format",
+        choices=("torchscript", "aoti"),
+        default="torchscript",
+    )
+    parser.add_argument(
+        "--force-output",
+        choices=("atom", "pair_gradient"),
+        default="atom",
+    )
+    parser.add_argument(
+        "--validate-pair-layout",
+        action="store_true",
+        help="Validate reverse indices/displacements on every paired forward (debug only).",
+    )
     parser.add_argument("--natom-basis", type=int, default=60)
     parser.add_argument("--n-radial", type=int, default=40)
     parser.add_argument("--cutoff", type=float, default=5.0)
@@ -396,8 +650,31 @@ def main() -> int:
     e0_lookup = _load_energy_baseline_lookup(args.energy_baseline_json).to(device)
     if args.aggregation_mode == "csr" and args.forward_mode != "md":
         raise ValueError("--aggregation-mode csr requires --forward-mode md")
+    if args.edge_layout == "md_cuda_paired" and args.forward_mode != "md":
+        raise ValueError("--edge-layout md_cuda_paired requires --forward-mode md")
+    if args.edge_layout == "md_cuda_paired" and args.aggregation_mode != "scatter":
+        raise ValueError("--edge-layout md_cuda_paired is incompatible with CSR aggregation")
+    if args.geometry_mode == "shared" and args.edge_layout != "md_cuda_paired":
+        raise ValueError("--geometry-mode shared currently requires --edge-layout md_cuda_paired")
+    if args.edge_layout == "md_cuda_paired" and args.geometry_mode != "shared":
+        raise ValueError("--edge-layout md_cuda_paired requires --geometry-mode shared")
+    if args.filter_projection == "stacked" and args.geometry_mode != "shared":
+        raise ValueError("--filter-projection stacked requires --geometry-mode shared")
+    if args.force_output == "pair_gradient" and args.edge_layout != "md_cuda_paired":
+        raise ValueError("--force-output pair_gradient requires --edge-layout md_cuda_paired")
+    if args.artifact_format == "aoti":
+        raise ValueError("AOTI export requires the Hydra feasibility gate and is not enabled yet")
     if args.aggregation_mode == "csr":
         wrapper = PainnMDCSRInferenceWrapper(base, e0_lookup).to(device).eval()
+    elif args.edge_layout == "md_cuda_paired":
+        _validate_shared_geometry(base)
+        wrapper = PainnMDPairedInferenceWrapper(
+            base,
+            e0_lookup,
+            stacked_filters=args.filter_projection == "stacked",
+            return_pair_gradient=args.force_output == "pair_gradient",
+            validate_layout=args.validate_pair_layout,
+        ).to(device).eval()
     elif args.forward_mode == "md":
         wrapper = PainnMDInferenceWrapper(base, e0_lookup).to(device).eval()
     else:
