@@ -23,6 +23,7 @@ if TORCH_SPEC is not None:
         PainnMDInferenceWrapper,
         PainnMDNNPWrapper,
         PainnMDPairedInferenceWrapper,
+        PainnMDSharedGeometryInferenceWrapper,
         _validate_shared_geometry,
     )
 else:  # pragma: no cover - depends on the optional local ML runtime.
@@ -124,6 +125,44 @@ class PainnMDInferenceExportTests(unittest.TestCase):
 
         self.assertLessEqual(float(torch.abs(directed_energy - paired_energy)), 1e-4)
         self.assertLessEqual(float(torch.max(torch.abs(directed_forces - paired_forces))), 1e-5)
+
+    def test_directed_shared_geometry_matches_md_forward(self) -> None:
+        directed = PainnMDInferenceWrapper(self.base, self.baseline).eval()
+        shared = PainnMDSharedGeometryInferenceWrapper(self.base, self.baseline).eval()
+
+        directed_energy, directed_forces = directed(
+            self.atomic_numbers,
+            self.edge_index,
+            self.edge_weight,
+        )
+        shared_energy, shared_forces = shared(
+            self.atomic_numbers,
+            self.edge_index,
+            self.edge_weight,
+        )
+
+        self.assertLessEqual(float(torch.abs(directed_energy - shared_energy)), 1e-4)
+        self.assertLessEqual(float(torch.max(torch.abs(directed_forces - shared_forces))), 1e-5)
+
+    def test_directed_shared_stacked_matches_per_layer(self) -> None:
+        shared = PainnMDSharedGeometryInferenceWrapper(self.base, self.baseline).eval()
+        stacked = PainnMDSharedGeometryInferenceWrapper(
+            self.base,
+            self.baseline,
+            stacked_filters=True,
+        ).eval()
+        shared_energy, shared_forces = shared(
+            self.atomic_numbers,
+            self.edge_index,
+            self.edge_weight,
+        )
+        stacked_energy, stacked_forces = stacked(
+            self.atomic_numbers,
+            self.edge_index,
+            self.edge_weight,
+        )
+        self.assertLessEqual(float(torch.abs(shared_energy - stacked_energy)), 1e-4)
+        self.assertLessEqual(float(torch.max(torch.abs(shared_forces - stacked_forces))), 1e-5)
 
     def test_paired_stacked_filters_match_per_layer(self) -> None:
         edge_index, edge_weight = self.paired_graph()
