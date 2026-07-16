@@ -34,7 +34,21 @@ class ExactEnergyModule(torch.nn.Module):
         edge_index: torch.Tensor,
         edge_weight_e3: torch.Tensor,
     ) -> torch.Tensor:
-        atom_energy = self.base.atomic_energies(z, edge_index, edge_weight_e3)
+        node_scalar = self.base.embedding(z)
+        node_vector = torch.zeros(
+            (node_scalar.shape[0], 3, node_scalar.shape[1]),
+            dtype=node_scalar.dtype,
+            device=node_scalar.device,
+        )
+        for message, mixing in zip(self.base.message_layers, self.base.mixing_layers):
+            node_scalar, node_vector = message(
+                node_scalar,
+                node_vector,
+                edge_index,
+                edge_weight_e3,
+            )
+            node_scalar, node_vector = mixing(node_scalar, node_vector)
+        atom_energy = self.base.output(node_scalar)
         baseline = self.e0_lookup[z].to(dtype=atom_energy.dtype).sum()
         return atom_energy.sum() + baseline
 
