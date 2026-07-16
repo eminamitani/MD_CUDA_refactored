@@ -72,6 +72,9 @@ def main() -> int:
     parser.add_argument("--max-atoms", type=int, default=96)
     parser.add_argument("--cutoff", type=float, default=5.0)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--variants", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=20260716)
+    parser.add_argument("--displacement-scale", type=float, default=0.02)
     parser.add_argument("--energy-tolerance-ev", type=float, default=1e-4)
     parser.add_argument("--force-tolerance-ev-a", type=float, default=1e-5)
     args = parser.parse_args()
@@ -90,23 +93,57 @@ def main() -> int:
             str(args.stacked), map_location=device
         ).eval()
 
-    reference_energy, reference_forces = directed(z, edge_index, edge_weight)
-    comparisons: dict[str, dict[str, float | bool]] = {}
+    if args.variants < 1:
+        raise ValueError("--variants must be positive")
+    pair_count = edge_index.shape[1] // 2
+    pair_weight = edge_weight[:, :pair_count]
+    generator = torch.Generator(device="cpu").manual_seed(args.seed)
+    edge_weight_variants = [edge_weight]
+    strain_scales = (0.99, 1.01, 1.02)
+    for variant_index in range(1, args.variants):
+        if variant_index <= len(strain_scales):
+            varied_pair = pair_weight * strain_scales[variant_index - 1]
+        else:
+            noise = torch.randn(
+                pair_weight.shape,
+                generator=generator,
+                dtype=pair_weight.dtype,
+            ) * args.displacement_scale
+            varied_pair = pair_weight.cpu() + noise
+            varied_pair = varied_pair.to(device)
+        edge_weight_variants.append(torch.cat((varied_pair, -varied_pair), dim=1))
+
+    comparisons: dict[str, dict[str, object]] = {}
     passed = True
     for name, model in candidates.items():
-        energy, forces = model(z, edge_index, edge_weight)
-        metrics = force_metrics(reference_forces, forces)
-        energy_difference = float(torch.abs(reference_energy - energy))
-        candidate_passed = (
-            energy_difference <= args.energy_tolerance_ev
-            and metrics["max_force_difference_ev_a"] <= args.force_tolerance_ev_a
-            and bool(torch.isfinite(energy))
-            and bool(torch.isfinite(forces).all())
-        )
+        energy_differences: list[float] = []
+        max_force_differences: list[float] = []
+        rms_force_differences: list[float] = []
+        finite = True
+        failed_variants: list[int] = []
+        for variant_index, variant_weight in enumerate(edge_weight_variants):
+            reference_energy, reference_forces = directed(z, edge_index, variant_weight)
+            energy, forces = model(z, edge_index, variant_weight)
+            metrics = force_metrics(reference_forces, forces)
+            energy_difference = float(torch.abs(reference_energy - energy))
+            energy_differences.append(energy_difference)
+            max_force_differences.append(metrics["max_force_difference_ev_a"])
+            rms_force_differences.append(metrics["rms_force_difference_ev_a"])
+            variant_finite = bool(torch.isfinite(energy) and torch.isfinite(forces).all())
+            finite = finite and variant_finite
+            if (
+                energy_difference > args.energy_tolerance_ev
+                or metrics["max_force_difference_ev_a"] > args.force_tolerance_ev_a
+                or not variant_finite
+            ):
+                failed_variants.append(variant_index)
+        candidate_passed = not failed_variants
         comparisons[name] = {
-            "energy_difference_ev": energy_difference,
-            **metrics,
-            "finite": bool(torch.isfinite(energy) and torch.isfinite(forces).all()),
+            "max_energy_difference_ev": max(energy_differences),
+            "max_force_difference_ev_a": max(max_force_differences),
+            "max_rms_force_difference_ev_a": max(rms_force_differences),
+            "finite": finite,
+            "failed_variant_indices": failed_variants,
             "passed": candidate_passed,
         }
         passed = passed and candidate_passed
@@ -116,6 +153,7 @@ def main() -> int:
         "atoms": int(z.shape[0]),
         "pairs": int(edge_index.shape[1] // 2),
         "directed_edges": int(edge_index.shape[1]),
+        "variants": len(edge_weight_variants),
         "energy_tolerance_ev": args.energy_tolerance_ev,
         "force_tolerance_ev_a": args.force_tolerance_ev_a,
         "comparisons": comparisons,
