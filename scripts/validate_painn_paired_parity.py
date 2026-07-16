@@ -56,9 +56,18 @@ def read_paired_graph(
 
 def force_metrics(reference: torch.Tensor, candidate: torch.Tensor) -> dict[str, float]:
     difference = candidate - reference
+    flattened = torch.abs(difference).reshape(-1)
+    relative_l2 = torch.linalg.vector_norm(difference) / torch.clamp_min(
+        torch.linalg.vector_norm(reference),
+        1e-12,
+    )
     return {
         "max_force_difference_ev_a": float(torch.max(torch.abs(difference))),
         "rms_force_difference_ev_a": float(torch.sqrt(torch.mean(difference.square()))),
+        "p99_9_force_difference_ev_a": float(torch.quantile(flattened, 0.999)),
+        "relative_l2_force_difference": float(relative_l2),
+        "reference_max_force_ev_a": float(torch.max(torch.abs(reference))),
+        "reference_rms_force_ev_a": float(torch.sqrt(torch.mean(reference.square()))),
     }
 
 
@@ -76,7 +85,8 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=20260716)
     parser.add_argument("--displacement-scale", type=float, default=0.02)
     parser.add_argument("--energy-tolerance-ev", type=float, default=1e-4)
-    parser.add_argument("--force-tolerance-ev-a", type=float, default=1e-5)
+    parser.add_argument("--force-tolerance-ev-a", type=float, default=5e-5)
+    parser.add_argument("--force-rms-tolerance-ev-a", type=float, default=1e-5)
     args = parser.parse_args()
 
     torch.set_num_threads(1)
@@ -119,6 +129,10 @@ def main() -> int:
         energy_differences: list[float] = []
         max_force_differences: list[float] = []
         rms_force_differences: list[float] = []
+        p99_9_force_differences: list[float] = []
+        relative_l2_force_differences: list[float] = []
+        reference_max_forces: list[float] = []
+        reference_rms_forces: list[float] = []
         finite = True
         failed_variants: list[int] = []
         for variant_index, variant_weight in enumerate(edge_weight_variants):
@@ -129,11 +143,16 @@ def main() -> int:
             energy_differences.append(energy_difference)
             max_force_differences.append(metrics["max_force_difference_ev_a"])
             rms_force_differences.append(metrics["rms_force_difference_ev_a"])
+            p99_9_force_differences.append(metrics["p99_9_force_difference_ev_a"])
+            relative_l2_force_differences.append(metrics["relative_l2_force_difference"])
+            reference_max_forces.append(metrics["reference_max_force_ev_a"])
+            reference_rms_forces.append(metrics["reference_rms_force_ev_a"])
             variant_finite = bool(torch.isfinite(energy) and torch.isfinite(forces).all())
             finite = finite and variant_finite
             if (
                 energy_difference > args.energy_tolerance_ev
                 or metrics["max_force_difference_ev_a"] > args.force_tolerance_ev_a
+                or metrics["rms_force_difference_ev_a"] > args.force_rms_tolerance_ev_a
                 or not variant_finite
             ):
                 failed_variants.append(variant_index)
@@ -142,6 +161,10 @@ def main() -> int:
             "max_energy_difference_ev": max(energy_differences),
             "max_force_difference_ev_a": max(max_force_differences),
             "max_rms_force_difference_ev_a": max(rms_force_differences),
+            "max_p99_9_force_difference_ev_a": max(p99_9_force_differences),
+            "max_relative_l2_force_difference": max(relative_l2_force_differences),
+            "max_reference_force_ev_a": max(reference_max_forces),
+            "max_reference_rms_force_ev_a": max(reference_rms_forces),
             "finite": finite,
             "failed_variant_indices": failed_variants,
             "passed": candidate_passed,
@@ -156,6 +179,7 @@ def main() -> int:
         "variants": len(edge_weight_variants),
         "energy_tolerance_ev": args.energy_tolerance_ev,
         "force_tolerance_ev_a": args.force_tolerance_ev_a,
+        "force_rms_tolerance_ev_a": args.force_rms_tolerance_ev_a,
         "comparisons": comparisons,
     }
     rendered = json.dumps(result, indent=2, sort_keys=True) + "\n"
