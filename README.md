@@ -281,6 +281,20 @@ and `scripts/benchmark_painn_compile_feasibility.py` stops before compilation
 when the functional AOTAutograd force path fails the same gate.  The default
 directed, per-layer MD export remains unchanged.
 
+Short-MD validation separates same-state model accuracy from propagated
+trajectory differences.  Generate deterministic 100-step NVE/NVT inputs with
+`scripts/generate_painn_pair_md_diagnostic_config.py` and record position,
+velocity, force, and energy at every step.  The raw comparator
+`scripts/compare_painn_pair_md_trajectories.py` intentionally reports the old
+absolute force gate as well as max, RMS, p99.9, and relative-L2 differences.
+Because GPU scatter/autograd can make two independent runs of the unchanged
+baseline diverge at that gate, repeat the baseline once and use
+`scripts/assess_painn_pair_md_propagation.py` to apply three separate checks:
+static same-state parity, bounded position/velocity propagation, and a force
+drift anomaly envelope relative to the repeated-baseline noise floor.  Force
+values evaluated on already different coordinates are not treated as a second
+same-state accuracy test.
+
 All NNP variants expect a tuple-like output:
 
 ```text
