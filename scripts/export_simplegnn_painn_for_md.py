@@ -275,34 +275,46 @@ class PainnMDPairedInferenceWrapper(torch.nn.Module):
             else:
                 filters = message.filter_network(basis) * cutoff
 
-            messages_i = filters * context[index_j]
-            messages_j = filters * context[index_i]
-            scalar_i, radial_i, vector_i = torch.split(
-                messages_i,
-                message.natom_basis,
-                dim=-1,
-            )
-            scalar_j, radial_j, vector_j = torch.split(
-                messages_j,
+            # Reconstruct the exact MD_CUDA directed-edge order (all forward
+            # pairs followed by all reverse pairs).  Geometry and filter
+            # projection stay shared, while using one scatter per update keeps
+            # the numerical reduction path aligned with the directed wrapper.
+            directed_target = torch.cat((index_i, index_j), dim=0)
+            directed_source = torch.cat((index_j, index_i), dim=0)
+            directed_filters = torch.cat((filters, filters), dim=0)
+            directed_directions = torch.cat((directions, -directions), dim=0)
+            messages = directed_filters * context[directed_source]
+            scalar_message, radial_message, vector_message = torch.split(
+                messages,
                 message.natom_basis,
                 dim=-1,
             )
 
             scalar_update = torch.zeros_like(node_scalar)
-            scalar_update = torch.index_add(scalar_update, 0, index_i, scalar_i)
-            scalar_update = torch.index_add(scalar_update, 0, index_j, scalar_j)
-
-            pair_vector_i = (
-                radial_i.unsqueeze(1) * directions[..., None]
-                + vector_i.unsqueeze(1) * node_vector[index_j]
+            scalar_index = directed_target.unsqueeze(1).expand_as(scalar_message)
+            scalar_update = torch.scatter_add(
+                scalar_update,
+                0,
+                scalar_index,
+                scalar_message,
             )
-            pair_vector_j = (
-                -radial_j.unsqueeze(1) * directions[..., None]
-                + vector_j.unsqueeze(1) * node_vector[index_i]
+
+            directed_vector_message = (
+                radial_message.unsqueeze(1) * directed_directions[..., None]
+                + vector_message.unsqueeze(1) * node_vector[directed_source]
             )
             vector_update = torch.zeros_like(node_vector)
-            vector_update = torch.index_add(vector_update, 0, index_i, pair_vector_i)
-            vector_update = torch.index_add(vector_update, 0, index_j, pair_vector_j)
+            vector_index = (
+                directed_target.unsqueeze(-1)
+                .unsqueeze(-1)
+                .expand_as(directed_vector_message)
+            )
+            vector_update = torch.scatter_add(
+                vector_update,
+                0,
+                vector_index,
+                directed_vector_message,
+            )
 
             node_scalar = node_scalar + scalar_update
             node_vector = node_vector + vector_update
