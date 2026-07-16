@@ -146,13 +146,126 @@ class PainnMDInferenceWrapper(torch.nn.Module):
         return atom_energy.sum() + baseline, forces_soa
 
 
+class PainnMDFunctionalSmoothstepEnvelope(torch.nn.Module):
+    """Storage-free equivalent of simplegnn's scripted smoothstep envelope."""
+
+    def __init__(self, rc: float, order: int):
+        super().__init__()
+        self.rc = float(rc)
+        self.order = int(order)
+
+    def forward(self, r: Tensor) -> Tensor:
+        t = (r / self.rc).clamp(0.0, 1.0)
+        y = torch.zeros_like(t)
+        if self.order == 1:
+            y = y * t + 1.0
+            y = y * t
+        elif self.order == 2:
+            y = y * t - 2.0
+            y = y * t + 3.0
+            y = y * t
+            y = y * t
+        elif self.order == 3:
+            y = y * t + 6.0
+            y = y * t - 15.0
+            y = y * t + 10.0
+            y = y * t
+            y = y * t
+            y = y * t
+        elif self.order == 4:
+            y = y * t - 20.0
+            y = y * t + 70.0
+            y = y * t - 84.0
+            y = y * t + 35.0
+            y = y * t
+            y = y * t
+            y = y * t
+            y = y * t
+        elif self.order == 5:
+            y = y * t + 70.0
+            y = y * t - 315.0
+            y = y * t + 540.0
+            y = y * t - 420.0
+            y = y * t + 126.0
+            y = y * t
+            y = y * t
+            y = y * t
+            y = y * t
+            y = y * t
+        else:
+            raise RuntimeError("smoothstep order must be in {1,2,3,4,5}")
+        cutoff = (1.0 - y) * (r < self.rc).to(r.dtype)
+        return cutoff.unsqueeze(-1)
+
+
+class PainnMDFunctionalMessageLayer(torch.nn.Module):
+    """PaiNN message layer compatible with torch.func transforms."""
+
+    def __init__(self, base: torch.nn.Module):
+        super().__init__()
+        self.natom_basis = int(base.natom_basis)
+        self.radial = base.radial
+        if hasattr(base.envelope, "order"):
+            self.envelope = PainnMDFunctionalSmoothstepEnvelope(
+                float(base.envelope.rc),
+                int(base.envelope.order),
+            )
+        else:
+            self.envelope = base.envelope
+        self.interaction_context_network = base.interaction_context_network
+        self.filter_network = base.filter_network
+
+    def forward(
+        self,
+        node_scalar: Tensor,
+        node_vector: Tensor,
+        edge_index: Tensor,
+        edge_weight: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
+        context = self.interaction_context_network(node_scalar)
+        distances = torch.norm(edge_weight, dim=-1)
+        directions = edge_weight / distances.unsqueeze(-1)
+        basis = self.radial(distances)
+        cutoff = self.envelope(distances)
+        filters = self.filter_network(basis) * cutoff
+        index_i = edge_index[0]
+        index_j = edge_index[1]
+        messages = filters * context[index_j]
+        scalar_message, radial_message, vector_message = torch.split(
+            messages,
+            self.natom_basis,
+            dim=-1,
+        )
+        scalar_update = torch.zeros_like(node_scalar)
+        scalar_update = torch.scatter_add(
+            scalar_update,
+            0,
+            index_i.unsqueeze(1).expand_as(scalar_message),
+            scalar_message,
+        )
+        directed_vector_message = (
+            radial_message.unsqueeze(1) * directions[..., None]
+            + vector_message.unsqueeze(1) * node_vector[index_j]
+        )
+        vector_update = torch.zeros_like(node_vector)
+        vector_update = torch.scatter_add(
+            vector_update,
+            0,
+            index_i.unsqueeze(-1).unsqueeze(-1).expand_as(directed_vector_message),
+            directed_vector_message,
+        )
+        return node_scalar + scalar_update, node_vector + vector_update
+
+
 class PainnMDEnergyModule(torch.nn.Module):
     """Pure directed-edge PaiNN energy graph for functional differentiation."""
 
     def __init__(self, base: torch.nn.Module, e0_lookup: Tensor):
         super().__init__()
         self.embedding = base.embedding
-        self.message_layers = base.message_layers
+        self.message_layers = torch.nn.ModuleList(
+            [PainnMDFunctionalMessageLayer(message) for message in base.message_layers]
+        )
         self.mixing_layers = base.mixing_layers
         self.output = base.output
         self.register_buffer("e0_lookup", e0_lookup)
