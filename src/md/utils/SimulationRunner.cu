@@ -407,6 +407,7 @@ void SimulationRunner::build_observer(const json& o_setting, long long total_ste
         int n_per_decade = o_setting.value("N_per_decade", o_setting.value("divisions", 5));
         int burst_length = o_setting.value("M_burst", o_setting.value("burst_length", 10));
         int burst_interval = o_setting.value("interval_burst", o_setting.value("burst_interval", 10));
+        long long linear_interval = o_setting.value("linear_interval", 0LL);
         bool is_unwrap = o_setting.value("is_unwrap", true);
         bool write_metadata = o_setting.value("write_metadata", true);
         bool include_initial = o_setting.value("include_initial", true);
@@ -432,6 +433,7 @@ void SimulationRunner::build_observer(const json& o_setting, long long total_ste
             n_per_decade,
             burst_length,
             burst_interval,
+            linear_interval,
             total_steps,
             dense_until,
             auto_dense_until,

@@ -40,6 +40,7 @@ DenseLogBurstExportTrajectory::DenseLogBurstExportTrajectory(
     int _n_per_decade,
     int _burst_length,
     int _burst_interval,
+    long long _linear_interval,
     long long _total_steps,
     long long _dense_until,
     bool _auto_dense_until,
@@ -52,6 +53,7 @@ DenseLogBurstExportTrajectory::DenseLogBurstExportTrajectory(
 ) : n_per_decade(_n_per_decade),
     burst_length(_burst_length),
     burst_interval(std::max(1, _burst_interval)),
+    linear_interval(_linear_interval),
     total_steps(_total_steps),
     dense_until(_dense_until),
     auto_dense_until(_auto_dense_until),
@@ -66,6 +68,9 @@ DenseLogBurstExportTrajectory::DenseLogBurstExportTrajectory(
     }
     if (burst_length < 1) {
         throw std::runtime_error("dense_log_burst_export_trajectory requires M_burst/burst_length >= 1.");
+    }
+    if (linear_interval < 0) {
+        throw std::runtime_error("dense_log_burst_export_trajectory requires linear_interval >= 0.");
     }
     if (total_steps < 0) {
         throw std::runtime_error("dense_log_burst_export_trajectory requires simulation total steps.");
@@ -90,6 +95,7 @@ void DenseLogBurstExportTrajectory::init(State& state) {
               << ", N_per_decade=" << n_per_decade
               << ", M_burst=" << burst_length
               << ", interval_burst=" << burst_interval
+              << ", linear_interval=" << linear_interval
               << std::endl;
 
     if (include_initial) {
@@ -124,6 +130,10 @@ DenseLogBurstExportTrajectory::should_emit(long long relative_step) {
 
     if (burst.step(relative_step)) {
         return {true, SampleType::Burst, burst.burst_id, burst.burst_idx};
+    }
+
+    if (linear_interval > 0 && relative_step % linear_interval == 0) {
+        return {true, SampleType::Linear, std::nullopt, std::nullopt};
     }
 
     return {false, SampleType::None, std::nullopt, std::nullopt};
@@ -185,6 +195,8 @@ const char* DenseLogBurstExportTrajectory::sample_type_name(SampleType type) {
             return "anchor";
         case SampleType::Burst:
             return "burst";
+        case SampleType::Linear:
+            return "linear";
         default:
             return "none";
     }

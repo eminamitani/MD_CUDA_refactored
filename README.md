@@ -228,6 +228,7 @@ For `dense_log_burst_export_trajectory`, a T3400K-style setup is:
   "N_per_decade": 5,
   "M_burst": 10,
   "interval_burst": 10,
+  "linear_interval": 0,
   "dense_until": "auto",
   "write_metadata": true
 }
@@ -239,6 +240,14 @@ metadata such as `step_rel`, `step_abs`, `time_fs`, `sample_type`, `burst_id`,
 and `burst_idx`, which makes time-window grouping easier in downstream MSD or
 VACF analysis. Keep `use_graph=false` for dense or burst trajectory sampling so
 the observer is called every MD step.
+
+Set `linear_interval` to a positive number to add a long-time uniform sampling
+grid to the same trajectory. Dense, anchor, and burst samples take priority
+when schedules coincide, so a step is written at most once. The default is
+`0`, which disables uniform fallback sampling and preserves the original
+dense-log-burst behavior. For example, with `dt=0.5 fs`,
+`linear_interval=1000` adds a 500 fs grid suitable for long-time multi-origin
+MSD while retaining the early dense and anchor-relative burst samples.
 
 ## Neural-network potential interface
 

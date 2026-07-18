@@ -19,6 +19,7 @@ namespace md::observers {
                 int n_per_decade,
                 int burst_length,
                 int burst_interval,
+                long long linear_interval,
                 long long total_steps,
                 long long dense_until,
                 bool auto_dense_until,
@@ -39,7 +40,8 @@ namespace md::observers {
                 Initial,
                 Dense,
                 Anchor,
-                Burst
+                Burst,
+                Linear
             };
 
             struct BurstState {
@@ -66,6 +68,7 @@ namespace md::observers {
             int n_per_decade;
             int burst_length;
             int burst_interval;
+            long long linear_interval;
             long long total_steps;
             long long dense_until;
             bool auto_dense_until;
