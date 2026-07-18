@@ -79,8 +79,6 @@ def validate_hybrid_schedule(
         sample_type: sum(observed_type == sample_type for _, observed_type in samples)
         for sample_type in sorted(KNOWN_SAMPLE_TYPES)
     }
-    if counts["linear"] == 0:
-        raise ValueError(f"{path}: no linear fallback samples")
     if counts["anchor"] == 0 or counts["burst"] == 0:
         raise ValueError(f"{path}: no anchor/burst samples")
 

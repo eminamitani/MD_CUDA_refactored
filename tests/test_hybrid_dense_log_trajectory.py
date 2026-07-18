@@ -85,6 +85,31 @@ class HybridDenseLogTrajectoryTests(unittest.TestCase):
             )
         self.assertEqual(summary["uniform_grid_frames"], 5)
 
+    def test_accepts_short_schedule_when_all_uniform_steps_have_priority_labels(self) -> None:
+        samples = [
+            (0, "initial"),
+            (1, "dense"),
+            (2, "dense"),
+            (3, "dense"),
+            (4, "dense"),
+            (5, "anchor"),
+            (6, "burst"),
+            (7, "burst"),
+            (8, "burst"),
+            (10, "anchor"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "all_collisions.extxyz"
+            path.write_text("".join(frame(*sample) for sample in samples), encoding="utf-8")
+            summary = validator.validate_hybrid_schedule(
+                path,
+                linear_interval=5,
+                total_steps=10,
+                dense_until=5,
+            )
+        self.assertEqual(summary["sample_type_counts"]["linear"], 0)
+        self.assertEqual(summary["uniform_grid_frames"], 3)
+
     def test_rejects_missing_uniform_grid_step(self) -> None:
         samples = [
             (0, "initial"),
