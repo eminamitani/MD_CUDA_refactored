@@ -19,6 +19,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dt-fs", type=float, required=True)
     parser.add_argument("--linear-interval", type=int, required=True)
     parser.add_argument("--max-lag-frames", type=int)
+    parser.add_argument("--block-count", type=int, default=8)
     parser.add_argument("--output-csv", type=Path, required=True)
     parser.add_argument("--output-json", type=Path, required=True)
     return parser
@@ -39,6 +40,8 @@ def main() -> int:
     positions = np.stack([frame.positions for frame in selected])
     max_lag = args.max_lag_frames or (len(selected) - 1)
     max_lag = min(max_lag, len(selected) - 1)
+    if args.block_count < 1:
+        raise ValueError("block-count must be positive")
     species = sorted(set(symbols.tolist()))
     rows: list[dict[str, float | int | str]] = []
     for lag in range(1, max_lag + 1):
@@ -48,6 +51,7 @@ def main() -> int:
             values = squared[:, symbols == element]
             rows.append(
                 {
+                    "block_id": -1,
                     "species": element,
                     "lag_frames": lag,
                     "lag_steps": lag * args.linear_interval,
@@ -57,6 +61,21 @@ def main() -> int:
                     "atom_count": int(values.shape[1]),
                 }
             )
+            for block_id, block in enumerate(np.array_split(values, args.block_count, axis=0)):
+                if block.shape[0] == 0:
+                    continue
+                rows.append(
+                    {
+                        "block_id": block_id,
+                        "species": element,
+                        "lag_frames": lag,
+                        "lag_steps": lag * args.linear_interval,
+                        "lag_fs": lag * args.linear_interval * args.dt_fs,
+                        "msd_angstrom2": float(np.mean(block)),
+                        "origin_count": int(block.shape[0]),
+                        "atom_count": int(block.shape[1]),
+                    }
+                )
     args.output_csv.parent.mkdir(parents=True, exist_ok=True)
     with args.output_csv.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
@@ -70,6 +89,7 @@ def main() -> int:
         "last_step": selected[-1].step,
         "linear_interval": args.linear_interval,
         "dt_fs": args.dt_fs,
+        "block_count": args.block_count,
         "species": species,
         "output_csv": str(args.output_csv),
     }
