@@ -4,6 +4,9 @@
 #include <thrust/transform.h>
 #include <thrust/execution_policy.h>
 
+#include <cstdint>
+#include <string>
+
 struct dfloat3 {
     float *x, *y, *z;
 };
@@ -26,11 +29,14 @@ namespace md {
 
             int n_atoms = 0;
             float dt = 0.0f;
-            int current_steps = 0;
+            std::int64_t current_steps = 0;
+            std::int64_t absolute_steps = 0;
             float potential_energy = 0;
             int temperature_dof = 0;
             int thermostat_dof = 0;
             int com_drift_removal_interval = 0;
+            int trajectory_segment_id = -1;
+            std::string checkpoint_parent_id;
 
             cudaStream_t stream;
 

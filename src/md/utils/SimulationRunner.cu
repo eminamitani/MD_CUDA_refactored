@@ -3,6 +3,7 @@
 #include <md/utils/CudaCheck.cuh>
 
 #include <md/core/State.cuh>
+#include <md/core/CheckpointManager.cuh>
 #include <md/integrators/Integrator.cuh>
 #include <md/interactions/Interaction.cuh>
 #include <md/observers/Observer.cuh>
@@ -44,7 +45,12 @@
 
 #include <algorithm>
 #include <cctype>
+#include <csignal>
 #include <cmath>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <optional>
 
 using namespace md::utils;
 using namespace md;
@@ -53,6 +59,79 @@ using string = std::string;
 using json = nlohmann::json;
 
 namespace {
+    volatile std::sig_atomic_t checkpoint_stop_signal = 0;
+
+    void checkpoint_signal_handler(int signal_number) {
+        checkpoint_stop_signal = signal_number;
+    }
+
+    std::string segmented_output_pattern(const std::string& output_path) {
+        const std::filesystem::path path(output_path);
+        const std::string extension = path.extension().string();
+        const std::string stem = path.stem().string();
+        return (path.parent_path() / (stem + ".segment%04d" + extension)).string();
+    }
+
+    std::string format_segment_path(std::string pattern, int segment_id) {
+        const std::string token = "%04d";
+        const auto position = pattern.find(token);
+        if (position == std::string::npos) {
+            throw std::runtime_error("segment_output_pattern must contain %04d.");
+        }
+        char number[32];
+        std::snprintf(number, sizeof(number), "%04d", segment_id);
+        pattern.replace(position, token.size(), number);
+        return pattern;
+    }
+
+    void update_segment_manifest(
+        const std::filesystem::path& checkpoint_directory,
+        int segment_id,
+        const std::string& trajectory_path,
+        const std::string& parent_checkpoint,
+        std::int64_t start_step,
+        std::int64_t end_step,
+        const std::string& status
+    ) {
+        std::filesystem::create_directories(checkpoint_directory);
+        const auto manifest_path = checkpoint_directory / "segment_manifest.json";
+        json manifest = {
+            {"schema_version", 1},
+            {"segments", json::array()}
+        };
+        if (std::filesystem::is_regular_file(manifest_path)) {
+            std::ifstream input(manifest_path);
+            manifest = json::parse(input);
+            if (!manifest.contains("segments") || !manifest.at("segments").is_array()) {
+                throw std::runtime_error("Invalid segment_manifest.json.");
+            }
+        }
+        json record = {
+            {"segment_id", segment_id},
+            {"trajectory", std::filesystem::absolute(trajectory_path).string()},
+            {"parent_checkpoint_id", parent_checkpoint},
+            {"start_step", start_step},
+            {"end_step", end_step},
+            {"status", status}
+        };
+        bool replaced = false;
+        for (auto& existing : manifest["segments"]) {
+            if (existing.value("segment_id", -1) == segment_id) {
+                existing = record;
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) manifest["segments"].push_back(record);
+        const auto temporary = manifest_path.string() + ".tmp";
+        {
+            std::ofstream output(temporary, std::ios::trunc);
+            output << manifest.dump(2) << "\n";
+            if (!output) throw std::runtime_error("Could not write segment manifest.");
+        }
+        std::filesystem::rename(temporary, manifest_path);
+    }
+
     int parse_dof_string(const string& spec, int n_atoms) {
         string normalized;
         normalized.reserve(spec.size());
@@ -196,6 +275,7 @@ SimulationRunner::SimulationRunner(const string& setting_path) {
     std::ifstream f(setting_path);
     if (!f.is_open()) throw std::runtime_error("ファイルを開けません。" );
     this->j = json::parse(f);
+    this->setting_path = std::filesystem::absolute(setting_path);
 
     json m_setting = j.at("meta");
     json c_setting = j.at("common_settings");
@@ -216,19 +296,71 @@ SimulationRunner::SimulationRunner(const string& setting_path) {
     this->build_cell(c_setting.at("cell"));
     // ポテンシャル・隣接リストの初期化
     this->build_interaction(c_setting.at("interactions"));
+    const auto& potential_setting = c_setting.at("interactions").at("potentials");
+    if (potential_setting.contains("model_path")) {
+        this->model_path = std::filesystem::absolute(potential_setting.at("model_path").get<string>());
+    }
 
     // その他はシミュレーション毎の設定
 }
 
 SimulationRunner::~SimulationRunner() = default;
 
-void SimulationRunner::run() {
-    for (const auto& step : j["steps"]) {
+int SimulationRunner::run() {
+    checkpoint_stop_signal = 0;
+    std::signal(SIGUSR1, checkpoint_signal_handler);
+    std::signal(SIGTERM, checkpoint_signal_handler);
+
+    struct ResumeSelection {
+        md::checkpoint::RestartConfig config;
+        md::checkpoint::CheckpointRecord record;
+    };
+    std::optional<ResumeSelection> resume_selection;
+    for (std::size_t index = 0; index < j.at("steps").size(); ++index) {
+        const auto& candidate_step = j.at("steps").at(index);
+        if (!candidate_step.contains("simulation")) continue;
+        const auto& simulation = candidate_step.at("simulation");
+        const auto restart = md::checkpoint::RestartConfig::from_json(
+            simulation.value("restart", json::object())
+        );
+        if (!restart.enabled()) continue;
+        const auto record = md::checkpoint::CheckpointManager::discover(restart);
+        if (!record) {
+            if (restart.mode == "require") {
+                throw std::runtime_error(
+                    "restart.mode=require but no valid checkpoint exists in " + restart.directory.string()
+                );
+            }
+            continue;
+        }
+        const int recorded_index = record->metadata.at("workflow_step_index").get<int>();
+        if (recorded_index != static_cast<int>(index)) {
+            throw std::runtime_error("Checkpoint workflow_step_index does not match its configured step.");
+        }
+        if (!resume_selection ||
+            record->metadata.at("generation").get<std::int64_t>() >
+            resume_selection->record.metadata.at("generation").get<std::int64_t>()) {
+            resume_selection = ResumeSelection{restart, *record};
+        }
+    }
+
+    for (std::size_t step_index = 0; step_index < j.at("steps").size(); ++step_index) {
+        const auto& step = j.at("steps").at(step_index);
+        if (resume_selection &&
+            static_cast<int>(step_index) <
+            resume_selection->record.metadata.at("workflow_step_index").get<int>()) {
+            std::cout << "checkpointにより完了済みstepをスキップします: "
+                      << step.at("name").get<string>() << std::endl;
+            continue;
+        }
         string name = step.at("name");
         std::cout << "シミュレーション: " << name << "を実行します。" << std::endl;
 
         string step_mode = step.value("step", j.value("step", string("")));
-        if (step_mode == "reset") {
+        const bool resume_this_step =
+            resume_selection &&
+            resume_selection->record.metadata.at("workflow_step_index").get<int>() == static_cast<int>(step_index);
+        if (step_mode == "reset" && !resume_this_step) {
             state->current_steps = 0;
         }
 
@@ -243,17 +375,89 @@ void SimulationRunner::run() {
 
         if (step.contains("simulation")) {
             json s_setting = step.at("simulation");
+            const auto restart = md::checkpoint::RestartConfig::from_json(
+                s_setting.value("restart", json::object())
+            );
+            if (restart.enabled() && !resume_this_step && state->current_steps != 0) {
+                throw std::runtime_error(
+                    "restart-enabled simulation phases must start at step 0. "
+                    "Set step=\"reset\" for this phase."
+                );
+            }
 
             state->dt = s_setting.at("dt");
-            const long long total_steps = static_cast<long long>(
+            const long long duration_steps = static_cast<long long>(
                 s_setting.at("simulation_time").get<double>() / static_cast<double>(state->dt)
             );
+            const long long target_steps = restart.enabled()
+                ? duration_steps
+                : state->current_steps + duration_steps;
+
+            json effective_observer = *observer_setting;
+            std::string segment_trajectory_path;
+            std::int64_t segment_start_step = resume_this_step
+                ? resume_selection->record.metadata.at("current_steps").get<std::int64_t>()
+                : state->current_steps;
+            if (restart.enabled() && effective_observer.contains("output_path")) {
+                const int segment_id = resume_this_step
+                    ? resume_selection->record.metadata.at("segment_id").get<int>() + 1
+                    : 0;
+                const std::string original_path = effective_observer.at("output_path").get<string>();
+                const std::string pattern = effective_observer.value(
+                    "segment_output_pattern",
+                    segmented_output_pattern(original_path)
+                );
+                segment_trajectory_path = format_segment_path(pattern, segment_id);
+                effective_observer["output_path"] = segment_trajectory_path;
+                state->trajectory_segment_id = segment_id;
+                state->checkpoint_parent_id = resume_this_step
+                    ? resume_selection->record.metadata.at("checkpoint_id").get<string>()
+                    : std::string();
+            } else {
+                state->trajectory_segment_id = -1;
+                state->checkpoint_parent_id.clear();
+            }
 
             // オブザーバーの初期化
-            this->build_observer(*observer_setting, total_steps);
+            this->build_observer(effective_observer, restart.enabled() ? target_steps : duration_steps);
 
             // アンサンブルの初期化
             this->build_ensemble(s_setting.at("ensemble"));
+            std::optional<md::checkpoint::CheckpointManager> checkpoint_manager;
+            if (restart.enabled()) {
+                checkpoint_manager.emplace(
+                    restart,
+                    setting_path,
+                    model_path,
+                    lattice
+                );
+            }
+            if (resume_this_step) {
+                MD_CUDA_CHECK(cudaDeviceSynchronize());
+                auto load_result = checkpoint_manager->load(
+                    resume_selection->record,
+                    *state,
+                    *integrator,
+                    thermostat.get(),
+                    *observer,
+                    static_cast<int>(step_index),
+                    target_steps
+                );
+                velocities_initialized = true;
+                if (nl) nl->generate(*state, cell.get());
+                if (nl_cll) {
+                    auto* cubic_cell = dynamic_cast<md::cells::CubicCell*>(cell.get());
+                    if (!cubic_cell) throw std::runtime_error("Checkpoint restore requires cubic cell for CLL.");
+                    nl_cll->generate(*state, *cubic_cell);
+                }
+                interaction->calc_force(*state);
+                MD_CUDA_CHECK(cudaDeviceSynchronize());
+                checkpoint_manager->verify_recomputed_force(*state, load_result.saved_force);
+                std::cout << "checkpoint resumed: "
+                          << load_result.record.metadata.at("checkpoint_id").get<string>()
+                          << ", step=" << state->current_steps
+                          << ", segment=" << state->trajectory_segment_id << std::endl;
+            }
             // シミュレーターの作成
             Simulator simulator(*state, interaction.get(), integrator.get(), observer.get(), cell.get());
 
@@ -268,14 +472,77 @@ void SimulationRunner::run() {
                 );
             }
 
-            // シミュレーションの実行
-            simulator.run(s_setting.at("simulation_time"), use_graph);
+            const auto wall_start = std::chrono::steady_clock::now();
+            auto last_checkpoint_time = wall_start;
+            std::int64_t last_checkpoint_step = -1;
+            bool continuation_stop = false;
+            const auto stop_callback = [&](State& callback_state) {
+                if (!checkpoint_manager) return false;
+                if (callback_state.current_steps >= target_steps) return false;
+                if (callback_state.current_steps % restart.poll_interval_steps != 0) return false;
+                const auto now = std::chrono::steady_clock::now();
+                const double since_checkpoint =
+                    std::chrono::duration<double>(now - last_checkpoint_time).count();
+                const double elapsed = std::chrono::duration<double>(now - wall_start).count();
+                if (since_checkpoint >= restart.checkpoint_interval_seconds) {
+                    const auto saved = checkpoint_manager->save(
+                        callback_state,
+                        *integrator,
+                        thermostat.get(),
+                        *observer,
+                        static_cast<int>(step_index),
+                        name,
+                        target_steps
+                    );
+                    last_checkpoint_time = now;
+                    last_checkpoint_step = callback_state.current_steps;
+                    std::cout << "periodic checkpoint saved: "
+                              << saved.metadata.at("checkpoint_id").get<string>() << std::endl;
+                }
+                if (elapsed >= restart.max_walltime_seconds || checkpoint_stop_signal != 0) {
+                    if (last_checkpoint_step != callback_state.current_steps) {
+                        const auto saved = checkpoint_manager->save(
+                            callback_state,
+                            *integrator,
+                            thermostat.get(),
+                            *observer,
+                            static_cast<int>(step_index),
+                            name,
+                            target_steps
+                        );
+                        last_checkpoint_step = callback_state.current_steps;
+                        std::cout << "continuation checkpoint saved: "
+                                  << saved.metadata.at("checkpoint_id").get<string>() << std::endl;
+                    }
+                    continuation_stop = true;
+                    return true;
+                }
+                return false;
+            };
+
+            const auto run_status = simulator.run_until(target_steps, use_graph, stop_callback);
             MD_CUDA_CHECK(cudaDeviceSynchronize());
 
             auto end = std::chrono::steady_clock::now();
             double elapsed_s = std::chrono::duration<double>(end - start).count();
 
             std::cout << "かかった時間：" << elapsed_s << "s" << std::endl;
+            if (restart.enabled() && !segment_trajectory_path.empty()) {
+                update_segment_manifest(
+                    restart.directory,
+                    state->trajectory_segment_id,
+                    segment_trajectory_path,
+                    state->checkpoint_parent_id,
+                    segment_start_step,
+                    state->current_steps,
+                    run_status == Simulator::RunStatus::Completed ? "completed" : "continuation_ready"
+                );
+            }
+            if (run_status == Simulator::RunStatus::Stopped || continuation_stop) {
+                std::cout << "CONTINUE_READY step=" << state->current_steps << std::endl;
+                return 75;
+            }
+            resume_selection.reset();
 
         } else if (step.contains("minimize")) {
             json mi_setting = step.at("minimize");
@@ -298,6 +565,7 @@ void SimulationRunner::run() {
             throw std::runtime_error("stepキーワードが未知です。");
         }
     }
+    return 0;
 }
 
 void SimulationRunner::configure_units(const json& m_setting) {
@@ -468,6 +736,9 @@ void SimulationRunner::build_observer(const json& o_setting, long long total_ste
 }
 
 void SimulationRunner::build_ensemble(const json& e_setting) {
+    this->integrator.reset();
+    this->thermostat.reset();
+    this->scheduler.reset();
     string ensemble = e_setting.value("type", "NVE");
     bool initialize_velocities = e_setting.value("initialize_velocities", e_setting.value("init_velocities", !velocities_initialized));
     bool rescale_initial_temperature = e_setting.value("rescale_initial_temperature", false);

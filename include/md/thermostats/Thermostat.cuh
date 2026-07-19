@@ -1,5 +1,9 @@
 #pragma once
 
+#include <md/core/Checkpointable.cuh>
+
+#include <stdexcept>
+
 namespace md {
     class State;
 
@@ -11,6 +15,13 @@ namespace md {
 
             virtual void stepOne(State& state) = 0;
             virtual void stepTwo(State& state) = 0;
+            virtual std::string checkpoint_id() const { return "thermostat.stateless.v1"; }
+            virtual CheckpointBytes save_checkpoint(State&) const { return {}; }
+            virtual void load_checkpoint(State&, const CheckpointBytes& data) {
+                if (!data.empty()) {
+                    throw std::runtime_error("Unexpected checkpoint data for stateless thermostat.");
+                }
+            }
         
         protected:
             Thermostat() = default;

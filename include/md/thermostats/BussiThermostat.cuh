@@ -30,6 +30,9 @@ namespace md::thermostats {
 
             void stepOne(State& state) override { /*何もしない*/ }
             void stepTwo(State& state) override;
+            std::string checkpoint_id() const override { return "thermostat.bussi.curand.v1"; }
+            CheckpointBytes save_checkpoint(State& state) const override;
+            void load_checkpoint(State& state, const CheckpointBytes& data) override;
 
             void init(State& state, unsigned long long seed);
         private:

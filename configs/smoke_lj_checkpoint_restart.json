@@ -1,0 +1,72 @@
+{
+  "meta": {
+    "name": "smoke_lj_checkpoint_restart",
+    "unit": "lj",
+    "seed": 20260719
+  },
+  "common_settings": {
+    "atoms": {
+      "mode": "generate_binary_lj",
+      "n_atoms": 128,
+      "density": 1.2,
+      "ratio": [0.8, 0.2]
+    },
+    "cell": {
+      "type": "cubic"
+    },
+    "interactions": {
+      "cell_list": false,
+      "neighbour_list": {
+        "cutoff": 2.0,
+        "margin": 0.7,
+        "max_neighbours": 127
+      },
+      "potentials": {
+        "type": "lennard_jones",
+        "numbers": [0, 1],
+        "sigma": [1.0, 0.8, 0.8, 0.88],
+        "epsilon": [1.0, 1.5, 1.5, 0.5],
+        "cutoff": [1.5, 2.0, 2.0, 1.5]
+      }
+    }
+  },
+  "steps": [
+    {
+      "name": "restartable_production",
+      "step": "reset",
+      "simulation": {
+        "dt": 0.005,
+        "simulation_time": 0.1,
+        "ensemble": {
+          "type": "NVT",
+          "thermostat": "Bussi",
+          "tau": 0.02,
+          "seed": 12345,
+          "temperature": 1.0,
+          "scheduler": "constant"
+        },
+        "restart": {
+          "mode": "auto",
+          "directory": "outputs/checkpoint_smoke/checkpoints",
+          "checkpoint_interval_seconds": 3600,
+          "max_walltime_seconds": 1e-09,
+          "poll_interval_steps": 8,
+          "keep_generations": 2,
+          "strict_compatibility": true
+        },
+        "use_graph": false
+      },
+      "observer": {
+        "type": "linear_export_trajectory",
+        "interval": 2,
+        "output_path": "outputs/checkpoint_smoke/trajectory.extxyz",
+        "segment_output_pattern": "outputs/checkpoint_smoke/trajectory.segment%04d.extxyz",
+        "trajectory": {
+          "mode": "transport_base",
+          "format": "extxyz",
+          "coordinates": "wrapped"
+        }
+      }
+    }
+  ]
+}

@@ -33,6 +33,9 @@ namespace md::observers {
 
             void output(State& state) override;
             void init(State& state) override;
+            std::string checkpoint_id() const override { return "observer.dense_log_burst.v1"; }
+            CheckpointBytes save_checkpoint(State& state) const override;
+            void load_checkpoint(State& state, const CheckpointBytes& data) override;
 
         private:
             enum class SampleType {

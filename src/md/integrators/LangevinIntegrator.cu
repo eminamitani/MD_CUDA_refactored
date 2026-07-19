@@ -7,6 +7,9 @@
 
 #include <thrust/execution_policy.h>
 
+#include <cstring>
+#include <stdexcept>
+
 namespace {
     struct InitCurand {
         curandState* states;
@@ -176,4 +179,60 @@ void LangevinIntegrator::integrateStepTwo(State& state) {
             dt_half_conv
         )
     );
+}
+
+md::CheckpointBytes LangevinIntegrator::save_checkpoint(State& state) const {
+    cudaStreamSynchronize(state.stream);
+    const std::uint64_t count = curand_state.size();
+    const std::size_t state_bytes = static_cast<std::size_t>(count) * sizeof(curandState);
+    md::CheckpointBytes data(sizeof(std::uint64_t) + sizeof(float) * 2 + sizeof(int) + state_bytes);
+    std::size_t offset = 0;
+    std::memcpy(data.data() + offset, &count, sizeof(count));
+    offset += sizeof(count);
+    std::memcpy(data.data() + offset, &c1, sizeof(c1));
+    offset += sizeof(c1);
+    std::memcpy(data.data() + offset, &gamma, sizeof(gamma));
+    offset += sizeof(gamma);
+    std::memcpy(data.data() + offset, &dof, sizeof(dof));
+    offset += sizeof(dof);
+    if (state_bytes > 0) {
+        cudaMemcpy(
+            data.data() + offset,
+            thrust::raw_pointer_cast(curand_state.data()),
+            state_bytes,
+            cudaMemcpyDeviceToHost
+        );
+    }
+    return data;
+}
+
+void LangevinIntegrator::load_checkpoint(State& state, const md::CheckpointBytes& data) {
+    const std::size_t header_bytes = sizeof(std::uint64_t) + sizeof(float) * 2 + sizeof(int);
+    if (data.size() < header_bytes) {
+        throw std::runtime_error("Invalid Langevin checkpoint payload.");
+    }
+    std::size_t offset = 0;
+    std::uint64_t count = 0;
+    std::memcpy(&count, data.data() + offset, sizeof(count));
+    offset += sizeof(count);
+    std::memcpy(&c1, data.data() + offset, sizeof(c1));
+    offset += sizeof(c1);
+    std::memcpy(&gamma, data.data() + offset, sizeof(gamma));
+    offset += sizeof(gamma);
+    std::memcpy(&dof, data.data() + offset, sizeof(dof));
+    offset += sizeof(dof);
+    const std::size_t state_bytes = static_cast<std::size_t>(count) * sizeof(curandState);
+    if (count != static_cast<std::uint64_t>(state.n_atoms) || data.size() != offset + state_bytes) {
+        throw std::runtime_error("Langevin checkpoint atom/RNG state count mismatch.");
+    }
+    curand_state.resize(static_cast<std::size_t>(count));
+    if (state_bytes > 0) {
+        cudaMemcpy(
+            thrust::raw_pointer_cast(curand_state.data()),
+            data.data() + offset,
+            state_bytes,
+            cudaMemcpyHostToDevice
+        );
+    }
+    cudaStreamSynchronize(state.stream);
 }

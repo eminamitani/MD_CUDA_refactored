@@ -7,7 +7,10 @@
 #include <md/temperature_schedulers/TemperatureScheduler.cuh>
 
 #include <thrust/iterator/counting_iterator.h>
+#include <array>
 #include <cmath>
+#include <cstring>
+#include <stdexcept>
 
 namespace {
     __global__ void update_mass (
@@ -145,4 +148,33 @@ void NHC1::op(State& state) {
             c_state.scaling_factor
         )
     );
+}
+
+md::CheckpointBytes NHC1::save_checkpoint(State& state) const {
+    std::array<float, 6> values{};
+    cudaStreamSynchronize(state.stream);
+    cudaMemcpy(&values[0], c_state.pos, sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&values[1], c_state.vel, sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&values[2], c_state.force, sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&values[3], c_state.mass, sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&values[4], c_state.scaling_factor, sizeof(float), cudaMemcpyDeviceToHost);
+    values[5] = dof;
+    md::CheckpointBytes data(sizeof(values));
+    std::memcpy(data.data(), values.data(), sizeof(values));
+    return data;
+}
+
+void NHC1::load_checkpoint(State& state, const md::CheckpointBytes& data) {
+    std::array<float, 6> values{};
+    if (data.size() != sizeof(values)) {
+        throw std::runtime_error("Invalid NHC1 checkpoint payload size.");
+    }
+    std::memcpy(values.data(), data.data(), sizeof(values));
+    dof = values[5];
+    cudaMemcpy(c_state.pos, &values[0], sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(c_state.vel, &values[1], sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(c_state.force, &values[2], sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(c_state.mass, &values[3], sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(c_state.scaling_factor, &values[4], sizeof(float), cudaMemcpyHostToDevice);
+    cudaStreamSynchronize(state.stream);
 }

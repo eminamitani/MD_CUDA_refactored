@@ -1,6 +1,17 @@
 cmake_minimum_required(VERSION 3.18)
 project(MD_MLP LANGUAGES CXX CUDA)
 
+execute_process(
+    COMMAND git rev-parse --short=12 HEAD
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    OUTPUT_VARIABLE MD_BUILD_ID
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+if(NOT MD_BUILD_ID)
+    set(MD_BUILD_ID "unknown")
+endif()
+
 # C++17 を使用
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
@@ -112,6 +123,7 @@ if(ONNXRUNTIME_ROOT)
 endif()
 
 target_compile_features(MD_MLP PRIVATE cxx_std_17 cuda_std_17)
+target_compile_definitions(MD_MLP PRIVATE MD_BUILD_ID="${MD_BUILD_ID}")
 
 target_compile_options(MD_MLP PRIVATE 
     ${TORCH_CXX_FLAGS_LIST}

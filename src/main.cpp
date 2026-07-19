@@ -11,7 +11,7 @@ int main(int argc, char* argv[]) {
     
     std::string json_path = argv[1];
     md::utils::SimulationRunner runner(json_path);
-    runner.run();
+    return runner.run();
     
     } catch(const std::exception& e) {
         std::cerr << "[Error]" << e.what() << std::endl;

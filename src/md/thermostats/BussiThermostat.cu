@@ -9,6 +9,9 @@
 #include <thrust/transform_reduce.h>
 #include <thrust/iterator/counting_iterator.h>
 
+#include <cstring>
+#include <stdexcept>
+
 namespace {
     // Marsaglia and Tsang's Method (https://daannoordenbos.github.io/gamma-sampling/ を参考に書きました。)
     __device__ float generate_gamma(
@@ -115,4 +118,38 @@ void BussiThermostat::stepTwo(State& state) {
             this->scaling_factor
         )
     ); 
+}
+
+md::CheckpointBytes BussiThermostat::save_checkpoint(State& state) const {
+    cudaStreamSynchronize(state.stream);
+    md::CheckpointBytes data(sizeof(int) + sizeof(float) + sizeof(curandState));
+    std::memcpy(data.data(), &dof, sizeof(int));
+    float host_scaling = 0.0f;
+    cudaMemcpy(&host_scaling, scaling_factor, sizeof(float), cudaMemcpyDeviceToHost);
+    std::memcpy(data.data() + sizeof(int), &host_scaling, sizeof(float));
+    cudaMemcpy(
+        data.data() + sizeof(int) + sizeof(float),
+        curand_state,
+        sizeof(curandState),
+        cudaMemcpyDeviceToHost
+    );
+    return data;
+}
+
+void BussiThermostat::load_checkpoint(State& state, const md::CheckpointBytes& data) {
+    const std::size_t expected = sizeof(int) + sizeof(float) + sizeof(curandState);
+    if (data.size() != expected) {
+        throw std::runtime_error("Invalid Bussi checkpoint payload size.");
+    }
+    std::memcpy(&dof, data.data(), sizeof(int));
+    float host_scaling = 0.0f;
+    std::memcpy(&host_scaling, data.data() + sizeof(int), sizeof(float));
+    cudaMemcpy(scaling_factor, &host_scaling, sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(
+        curand_state,
+        data.data() + sizeof(int) + sizeof(float),
+        sizeof(curandState),
+        cudaMemcpyHostToDevice
+    );
+    cudaStreamSynchronize(state.stream);
 }

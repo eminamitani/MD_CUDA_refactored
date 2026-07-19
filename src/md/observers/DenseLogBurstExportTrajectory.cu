@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -268,4 +269,54 @@ long long DenseLogBurstExportTrajectory::find_dense_until(
     }
 
     return high;
+}
+
+md::CheckpointBytes DenseLogBurstExportTrajectory::save_checkpoint(State&) const {
+    struct Payload {
+        std::int64_t run_start_step;
+        std::int64_t next_anchor;
+        std::int64_t burst_id;
+        std::int64_t burst_next_step;
+        std::int32_t burst_remaining;
+        std::int32_t burst_interval;
+        std::int32_t burst_idx;
+        std::uint8_t burst_active;
+    } payload{
+        run_start_step,
+        next_anchor,
+        burst.burst_id,
+        burst.next_step,
+        burst.remaining,
+        burst.interval,
+        burst.burst_idx,
+        static_cast<std::uint8_t>(burst.active ? 1 : 0)
+    };
+    md::CheckpointBytes data(sizeof(payload));
+    std::memcpy(data.data(), &payload, sizeof(payload));
+    return data;
+}
+
+void DenseLogBurstExportTrajectory::load_checkpoint(State&, const md::CheckpointBytes& data) {
+    struct Payload {
+        std::int64_t run_start_step;
+        std::int64_t next_anchor;
+        std::int64_t burst_id;
+        std::int64_t burst_next_step;
+        std::int32_t burst_remaining;
+        std::int32_t burst_interval;
+        std::int32_t burst_idx;
+        std::uint8_t burst_active;
+    } payload{};
+    if (data.size() != sizeof(payload)) {
+        throw std::runtime_error("Invalid dense-log-burst observer checkpoint payload size.");
+    }
+    std::memcpy(&payload, data.data(), sizeof(payload));
+    run_start_step = payload.run_start_step;
+    next_anchor = payload.next_anchor;
+    burst.burst_id = payload.burst_id;
+    burst.next_step = payload.burst_next_step;
+    burst.remaining = payload.burst_remaining;
+    burst.interval = payload.burst_interval;
+    burst.burst_idx = payload.burst_idx;
+    burst.active = payload.burst_active != 0;
 }

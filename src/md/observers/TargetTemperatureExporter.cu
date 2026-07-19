@@ -6,6 +6,9 @@
 #include <md/utils/compute.cuh>
 #include <md/cells/CubicCell.cuh>
 
+#include <cstring>
+#include <stdexcept>
+
 using namespace md::observers;
 
 void TargetTemperatureExporter::output(State& state) {
@@ -26,4 +29,17 @@ void TargetTemperatureExporter::output(State& state) {
         exporter.export_trajectory(state);
         counter ++;
     }
+}
+
+md::CheckpointBytes TargetTemperatureExporter::save_checkpoint(State&) const {
+    md::CheckpointBytes data(sizeof(counter));
+    std::memcpy(data.data(), &counter, sizeof(counter));
+    return data;
+}
+
+void TargetTemperatureExporter::load_checkpoint(State&, const md::CheckpointBytes& data) {
+    if (data.size() != sizeof(counter)) {
+        throw std::runtime_error("Invalid TargetTemperatureExporter checkpoint size.");
+    }
+    std::memcpy(&counter, data.data(), sizeof(counter));
 }

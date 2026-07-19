@@ -4,6 +4,7 @@
 #include <random>
 #include <memory>
 #include <array>
+#include <filesystem>
 
 #include <external/nlohmann/json.hpp>
 
@@ -28,10 +29,12 @@ namespace md::utils {
             SimulationRunner(const std::string& setting_path);
             ~SimulationRunner();
 
-            void run();
+            int run();
 
         private:
             nlohmann::json j;
+            std::filesystem::path setting_path;
+            std::filesystem::path model_path;
 
             std::unique_ptr<State> state;
             std::unique_ptr<Integrator> integrator;

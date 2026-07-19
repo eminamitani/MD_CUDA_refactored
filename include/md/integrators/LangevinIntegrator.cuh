@@ -21,6 +21,9 @@ namespace md::integrators {
 
             void integrateStepOne(State& state) override;
             void integrateStepTwo(State& state) override;
+            std::string checkpoint_id() const override { return "integrator.langevin.curand.v1"; }
+            CheckpointBytes save_checkpoint(State& state) const override;
+            void load_checkpoint(State& state, const CheckpointBytes& data) override;
         
             void init(const State& satate, unsigned long long seed);
             

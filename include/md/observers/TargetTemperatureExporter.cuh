@@ -34,6 +34,9 @@ namespace md::observers {
             }
             void output(State& state) override;
             void init(State& state) override { /*何もしない*/}
+            std::string checkpoint_id() const override { return "observer.target_temperature_exporter.v1"; }
+            CheckpointBytes save_checkpoint(State& state) const override;
+            void load_checkpoint(State& state, const CheckpointBytes& data) override;
         private:
             std::vector<float> target_temperatures;
             std::vector<size_t> target_steps;

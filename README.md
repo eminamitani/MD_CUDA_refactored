@@ -92,6 +92,53 @@ Top-level keys:
 - `common_settings`: atoms, cell, neighbour list, and potential settings
 - `steps`: one or more simulation or minimization steps
 
+## Checkpoint/restart
+
+Restart is opt-in per simulation phase and is disabled by default. A
+restart-enabled phase must use `step: "reset"` so that `simulation_time`
+denotes the total phase duration instead of a duration to append:
+
+```json
+"restart": {
+  "mode": "auto",
+  "directory": "./checkpoints",
+  "checkpoint_interval_seconds": 3600,
+  "max_walltime_seconds": 244800,
+  "poll_interval_steps": 1000,
+  "keep_generations": 2,
+  "strict_compatibility": true
+}
+```
+
+`mode` may be `off`, `auto`, or `require`. Checkpoints are written only after a
+complete integration step and observer output. The binary payload contains the
+MD state plus Nose-Hoover, Bussi, Langevin/cuRAND, and stateful observer data.
+The JSON sidecar records SHA-256, model/config/build identity, CUDA/cuRAND
+compatibility, workflow phase, target step, and segment provenance. The newest
+two generations are retained; a corrupt newest generation falls back to the
+previous valid generation.
+
+Trajectory files are never appended. When restart is enabled, an observer
+`output_path` is converted to `name.segment0000.extxyz` by default. An explicit
+pattern can be supplied with:
+
+```json
+"segment_output_pattern": "./trajectory.segment%04d.extxyz"
+```
+
+Each frame includes `production_step_abs`, `time_fs_abs`, `segment_id`, and
+checkpoint-parent metadata. `checkpoints/segment_manifest.json` is consumed by
+`scripts/validate_segmented_trajectory.py` and
+`scripts/analyze_segmented_msd.py`, so analysis does not require physical file
+concatenation.
+
+At the internal wall-time deadline or after `SIGUSR1`/`SIGTERM`, the executable
+writes a validated continuation checkpoint and exits with code `75`.
+`scripts/run_restart_segment.sh` converts that code to a successful batch
+segment only after validating the checkpoint. On RCCS,
+`scripts/submit_restart_chain.sh` pre-submits a finite
+`jsub -W depend=afterok:<jobid>` chain; compute nodes do not self-submit.
+
 Supported atom initialization:
 
 - `generate_binary_lj`

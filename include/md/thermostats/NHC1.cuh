@@ -25,6 +25,9 @@ namespace md::thermostats {
             ~NHC1();
             void stepOne(State& state) override;
             void stepTwo(State& state) override;
+            std::string checkpoint_id() const override { return "thermostat.nhc1.v1"; }
+            CheckpointBytes save_checkpoint(State& state) const override;
+            void load_checkpoint(State& state, const CheckpointBytes& data) override;
 
             void init(State& state);
         

@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cstdint>
+#include <functional>
+
 namespace md {
     class State;
     class Interaction;
@@ -11,6 +14,11 @@ namespace md {
 namespace md {
     class Simulator {
         public:
+            enum class RunStatus {
+                Completed,
+                Stopped
+            };
+
             // コンストラクタ
             Simulator(
                 State& _state, 
@@ -22,6 +30,11 @@ namespace md {
         
             // シミュレーションの実行
             void run(float tsim, bool use_cuda_graphs=true);
+            RunStatus run_until(
+                std::int64_t target_step,
+                bool use_cuda_graphs,
+                const std::function<bool(State&)>& stop_callback = {}
+            );
         
         private:
             State& state;

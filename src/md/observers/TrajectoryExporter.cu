@@ -75,6 +75,18 @@ std::string TrajectoryExporter::frame_comment(
         if (spec.force) comment << " force_unit=eV_per_angstrom";
         if (spec.position) comment << " coordinates=" << (unwrap ? "unwrapped" : "wrapped");
     }
+    if (state.trajectory_segment_id >= 0) {
+        if (has_comment) comment << " ";
+        has_comment = true;
+        comment << "production_step_abs=" << state.current_steps
+                << " workflow_step_abs=" << state.absolute_steps
+                << " time_fs_abs=" << std::setprecision(16)
+                << static_cast<double>(state.dt) * static_cast<double>(state.current_steps)
+                << " segment_id=" << state.trajectory_segment_id;
+        if (!state.checkpoint_parent_id.empty()) {
+            comment << " checkpoint_parent=" << state.checkpoint_parent_id;
+        }
+    }
     if (!extra_comment.empty()) {
         if (has_comment) comment << " ";
         comment << extra_comment;
