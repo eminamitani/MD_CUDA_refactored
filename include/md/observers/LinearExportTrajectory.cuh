@@ -15,6 +15,7 @@ namespace md::observers{
             );
             void output(State& state) override;
             void init(State& state) override;
+            void finalize(State& state) override;
         private:
             int output_interval;
             TrajectoryExporter exporter;

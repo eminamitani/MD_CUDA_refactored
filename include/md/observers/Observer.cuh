@@ -14,6 +14,7 @@ namespace md{
 
             virtual void output(State& state) = 0;
             virtual void init(State& state) = 0;
+            virtual void finalize(State&) {}
             virtual std::string checkpoint_id() const { return "observer.stateless.v1"; }
             virtual CheckpointBytes save_checkpoint(State&) const { return {}; }
             virtual void load_checkpoint(State&, const CheckpointBytes& data) {

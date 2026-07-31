@@ -235,6 +235,27 @@ Trajectory-writing observers accept an optional field-selection block:
 }
 ```
 
+Uniform transport trajectories may also use the restart-safe binary chunk
+format:
+
+```json
+"trajectory": {
+  "mode": "transport_base",
+  "fields": ["position", "velocity", "energy"],
+  "coordinates": "wrapped",
+  "format": "transport_binary_v1",
+  "chunk_frames": 256
+}
+```
+
+For `transport_binary_v1`, `output_path` is a JSON manifest. Completed chunks
+are fixed-record little-endian binary files containing float32 positions and
+velocities in SoA xyz layout. Each chunk is first written with a `.partial`
+suffix, then atomically renamed and added to the manifest. The format requires
+`linear_export_trajectory`, wrapped positions, velocities, no force field, and
+a positive `chunk_frames`. Restarted runs retain the existing segment-manifest
+contract: each segment points to its own completed binary manifest.
+
 `fields`, when present, overrides the preset field list.  Species is always
 written.  Supported fields are `position`, `velocity`, `force`, and the global
 `energy`.  The presets are:

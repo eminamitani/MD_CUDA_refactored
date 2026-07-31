@@ -196,9 +196,15 @@ namespace {
         spec.write_field_metadata = true;
         spec.mode = trajectory.value("mode", "legacy");
         spec.format = trajectory.value("format", "extxyz");
-        if (spec.format != "extxyz") {
-            throw std::runtime_error("trajectory.format currently supports only extxyz.");
+        if (
+            spec.format != "extxyz" &&
+            spec.format != "transport_binary_v1"
+        ) {
+            throw std::runtime_error(
+                "trajectory.format supports extxyz or transport_binary_v1."
+            );
         }
+        spec.binary_chunk_frames = trajectory.value("chunk_frames", 256);
 
         if (spec.mode == "legacy") {
             spec.position = true;
@@ -265,6 +271,22 @@ namespace {
             if (coordinates == "wrapped") spec.unwrap = false;
             else if (coordinates == "unwrapped") spec.unwrap = true;
             else throw std::runtime_error("trajectory.coordinates must be wrapped or unwrapped.");
+        }
+        if (spec.format == "transport_binary_v1") {
+            if (
+                observer_type != "linear_export_trajectory" ||
+                !spec.position ||
+                !spec.velocity ||
+                spec.force ||
+                spec.unwrap ||
+                spec.binary_chunk_frames <= 0
+            ) {
+                throw std::runtime_error(
+                    "transport_binary_v1 requires linear_export_trajectory, "
+                    "wrapped position and velocity, no force, and positive "
+                    "trajectory.chunk_frames."
+                );
+            }
         }
         return spec;
     }
@@ -522,6 +544,7 @@ int SimulationRunner::run() {
 
             const auto run_status = simulator.run_until(target_steps, use_graph, stop_callback);
             MD_CUDA_CHECK(cudaDeviceSynchronize());
+            observer->finalize(*state);
 
             auto end = std::chrono::steady_clock::now();
             double elapsed_s = std::chrono::duration<double>(end - start).count();

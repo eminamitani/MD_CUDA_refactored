@@ -30,3 +30,7 @@ void LinearExportTrajectory::init(State& state) {
     std::cout << time << ", " << std::flush;
     exporter.export_trajectory(state);
 }
+
+void LinearExportTrajectory::finalize(State&) {
+    exporter.finalize();
+}
