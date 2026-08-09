@@ -520,6 +520,7 @@ class PainnMDPairedInferenceWrapper(torch.nn.Module):
         stacked_filters: bool = False,
         return_pair_gradient: bool = False,
         validate_layout: bool = False,
+        short_range_gate: torch.nn.Module | None = None,
     ):
         super().__init__()
         if len(base.message_layers) == 0:
@@ -535,9 +536,34 @@ class PainnMDPairedInferenceWrapper(torch.nn.Module):
         self.stacked_filters = bool(stacked_filters)
         self.return_pair_gradient = bool(return_pair_gradient)
         self.validate_layout = bool(validate_layout)
+        self.short_range_gate_enabled = short_range_gate is not None
         self.num_interactions = len(base.message_layers)
         self.natom_basis = int(base.message_layers[0].natom_basis)
         self.register_buffer("e0_lookup", e0_lookup)
+        if short_range_gate is None:
+            self.register_buffer(
+                "short_range_gate_off_A", torch.zeros((1, 1), dtype=torch.float32)
+            )
+            self.register_buffer(
+                "short_range_gate_full_A", torch.zeros((1, 1), dtype=torch.float32)
+            )
+            self.register_buffer(
+                "short_range_gate_pair_enabled",
+                torch.zeros((1, 1), dtype=torch.bool),
+            )
+        else:
+            self.register_buffer(
+                "short_range_gate_off_A",
+                short_range_gate.off_A.detach().clone(),
+            )
+            self.register_buffer(
+                "short_range_gate_full_A",
+                short_range_gate.full_A.detach().clone(),
+            )
+            self.register_buffer(
+                "short_range_gate_pair_enabled",
+                short_range_gate.pair_enabled.detach().clone(),
+            )
 
         filter_weights = []
         filter_biases = []
@@ -590,6 +616,31 @@ class PainnMDPairedInferenceWrapper(torch.nn.Module):
         directions = pair_weight_e3 / distances.unsqueeze(-1)
         basis = self.radial(distances)
         cutoff = self.envelope(distances)
+        pair_message_gate = torch.ones_like(distances)
+        if self.short_range_gate_enabled:
+            z_i = Z[index_i]
+            z_j = Z[index_j]
+            gate_enabled = self.short_range_gate_pair_enabled[z_i, z_j]
+            gate_off = self.short_range_gate_off_A[z_i, z_j].to(
+                dtype=distances.dtype
+            )
+            gate_full = self.short_range_gate_full_A[z_i, z_j].to(
+                dtype=distances.dtype
+            )
+            gate_width = torch.where(
+                gate_enabled,
+                gate_full - gate_off,
+                torch.ones_like(gate_full),
+            )
+            gate_t = ((distances - gate_off) / gate_width).clamp(0.0, 1.0)
+            gate_smooth = gate_t.pow(3) * (
+                10.0 - 15.0 * gate_t + 6.0 * gate_t.pow(2)
+            )
+            pair_message_gate = torch.where(
+                gate_enabled,
+                gate_smooth,
+                pair_message_gate,
+            )
 
         if self.stacked_filters:
             stacked = F.linear(
@@ -619,9 +670,17 @@ class PainnMDPairedInferenceWrapper(torch.nn.Module):
         for message, mixing in zip(self.message_layers, self.mixing_layers):
             context = message.interaction_context_network(node_scalar)
             if self.stacked_filters:
-                filters = stacked[:, layer_index, :] * cutoff
+                filters = (
+                    stacked[:, layer_index, :]
+                    * cutoff
+                    * pair_message_gate.unsqueeze(-1)
+                )
             else:
-                filters = message.filter_network(basis) * cutoff
+                filters = (
+                    message.filter_network(basis)
+                    * cutoff
+                    * pair_message_gate.unsqueeze(-1)
+                )
 
             # Reconstruct the exact MD_CUDA directed-edge order (all forward
             # pairs followed by all reverse pairs).  Geometry and filter
@@ -691,6 +750,209 @@ class PainnMDPairedInferenceWrapper(torch.nn.Module):
         atom_forces = torch.index_add(atom_forces, 0, index_i, pair_gradient)
         atom_forces = torch.index_add(atom_forces, 0, index_j, -pair_gradient)
         return total_energy, atom_forces.transpose(0, 1).contiguous()
+
+
+class RepulsiveMDKernel(torch.nn.Module):
+    """TorchScript pair-energy kernel copied from a fixed SimpleGNN baseline."""
+
+    def __init__(self, source: torch.nn.Module):
+        super().__init__()
+        self.register_buffer("cutoff_A", source.cutoff_A.detach().clone())
+        self.register_buffer("amplitude_eV", source.amplitude_eV.detach().clone())
+        self.register_buffer(
+            "zbl_screening_A", source.zbl_screening_A.detach().clone()
+        )
+        self.register_buffer("pair_enabled", source.pair_enabled.detach().clone())
+        self.register_buffer(
+            "zbl_coefficients", source.zbl_coefficients.detach().clone()
+        )
+        self.register_buffer("zbl_exponents", source.zbl_exponents.detach().clone())
+        self.family_code = int(source.family_code)
+        self.switch_start_fraction = float(source.switch_start_fraction)
+
+    def forward(
+        self, Z: Tensor, edge_index: Tensor, edge_weight_e3: Tensor
+    ) -> Tensor:
+        z_i = Z[edge_index[0]].long()
+        z_j = Z[edge_index[1]].long()
+        cutoff = self.cutoff_A[z_i, z_j].to(dtype=edge_weight_e3.dtype)
+        amplitude = self.amplitude_eV[z_i, z_j].to(dtype=edge_weight_e3.dtype)
+        screening = self.zbl_screening_A[z_i, z_j].to(
+            dtype=edge_weight_e3.dtype
+        )
+        enabled = self.pair_enabled[z_i, z_j]
+        z_product = (z_i * z_j).to(dtype=edge_weight_e3.dtype)
+        distance = torch.linalg.vector_norm(edge_weight_e3, dim=-1).clamp_min(
+            1.0e-8
+        )
+        inside = enabled & (distance < cutoff)
+        safe_cutoff = torch.where(enabled, cutoff, torch.ones_like(cutoff))
+
+        if self.family_code == 0:
+            t = distance / safe_cutoff
+            raw = amplitude * torch.pow(t, -6.0) * torch.pow(1.0 - t, 4.0)
+            return torch.where(inside, raw, torch.zeros_like(raw))
+
+        safe_screening = torch.where(
+            enabled, screening, torch.ones_like(screening)
+        )
+        x = distance / safe_screening
+        phi = torch.zeros_like(distance)
+        coefficients = self.zbl_coefficients.to(dtype=edge_weight_e3.dtype)
+        exponents = self.zbl_exponents.to(dtype=edge_weight_e3.dtype)
+        for index in range(4):
+            phi = phi + coefficients[index] * torch.exp(-exponents[index] * x)
+        zbl = 14.3996454784255 * z_product * phi / distance
+        switch_start = self.switch_start_fraction * safe_cutoff
+        s = ((distance - switch_start) / (safe_cutoff - switch_start)).clamp(
+            0.0, 1.0
+        )
+        switch = (
+            1.0
+            - 10.0 * torch.pow(s, 3.0)
+            + 15.0 * torch.pow(s, 4.0)
+            - 6.0 * torch.pow(s, 5.0)
+        )
+        return torch.where(inside, zbl * switch, torch.zeros_like(zbl))
+
+
+class PainnMDRepulsiveWrapper(torch.nn.Module):
+    """Add the fixed pair term to any three-input MD inference wrapper."""
+
+    def __init__(
+        self,
+        base: torch.nn.Module,
+        repulsive: RepulsiveMDKernel,
+        paired: bool = False,
+        return_pair_gradient: bool = False,
+        base_output_is_pair_gradient: bool = False,
+    ):
+        super().__init__()
+        self.base = base
+        self.repulsive = repulsive
+        self.paired = bool(paired)
+        self.return_pair_gradient = bool(return_pair_gradient)
+        self.base_output_is_pair_gradient = bool(base_output_is_pair_gradient)
+
+    def forward(
+        self, Z: Tensor, edge_index: Tensor, edge_weight: Tensor
+    ) -> Tuple[Tensor, Tensor]:
+        base_energy, base_output = self.base(Z, edge_index, edge_weight)
+        if Z.dtype != torch.long:
+            Z = Z.long()
+        if edge_index.dtype != torch.long:
+            edge_index = edge_index.long()
+
+        selected_index = edge_index
+        selected_weight = edge_weight
+        multiplier = 0.5
+        if self.paired:
+            edge_count = edge_index.shape[1]
+            if edge_count % 2 != 0:
+                raise RuntimeError(
+                    "md_cuda_paired repulsive layout requires an even edge count"
+                )
+            pair_count = edge_count // 2
+            selected_index = edge_index[:, :pair_count]
+            selected_weight = edge_weight[:, :pair_count]
+            multiplier = 1.0
+
+        selected_weight_e3 = selected_weight.transpose(0, 1).contiguous()
+        selected_weight_e3 = selected_weight_e3.detach().requires_grad_(True)
+        edge_energy = self.repulsive(Z, selected_index, selected_weight_e3)
+        repulsive_energy = multiplier * edge_energy.sum()
+        gradient = torch.autograd.grad(
+            [repulsive_energy], [selected_weight_e3], create_graph=True
+        )[0]
+        assert gradient is not None
+        gradient = gradient.detach()
+
+        if self.return_pair_gradient:
+            if not self.base_output_is_pair_gradient:
+                raise RuntimeError(
+                    "pair-gradient output requires a pair-gradient base wrapper"
+                )
+            return (
+                base_energy + repulsive_energy,
+                base_output + gradient.transpose(0, 1).contiguous(),
+            )
+
+        if self.paired and self.base_output_is_pair_gradient:
+            combined_gradient = (
+                base_output + gradient.transpose(0, 1).contiguous()
+            ).transpose(0, 1)
+            atom_forces = torch.zeros(
+                (Z.shape[0], 3),
+                dtype=combined_gradient.dtype,
+                device=combined_gradient.device,
+            )
+            atom_forces = torch.index_add(
+                atom_forces, 0, selected_index[0], combined_gradient
+            )
+            atom_forces = torch.index_add(
+                atom_forces, 0, selected_index[1], -combined_gradient
+            )
+            return (
+                base_energy + repulsive_energy,
+                atom_forces.transpose(0, 1).contiguous(),
+            )
+
+        force_i = torch.zeros(
+            (Z.shape[0], 3), dtype=gradient.dtype, device=gradient.device
+        )
+        force_j = torch.zeros_like(force_i)
+        force_i = torch.index_add(
+            force_i, 0, selected_index[0], gradient
+        )
+        force_j = torch.index_add(
+            force_j, 0, selected_index[1], -gradient
+        )
+        repulsive_forces = (force_i + force_j).transpose(0, 1).contiguous()
+        return base_energy + repulsive_energy, base_output + repulsive_forces
+
+
+class PainnMDCSRRepulsiveWrapper(torch.nn.Module):
+    """Add the fixed pair term while preserving the four-input CSR ABI."""
+
+    def __init__(self, base: torch.nn.Module, repulsive: RepulsiveMDKernel):
+        super().__init__()
+        self.base = base
+        self.repulsive = repulsive
+
+    def forward(
+        self,
+        Z: Tensor,
+        edge_index: Tensor,
+        edge_weight: Tensor,
+        offsets: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
+        base_energy, base_forces = self.base(
+            Z, edge_index, edge_weight, offsets
+        )
+        if Z.dtype != torch.long:
+            Z = Z.long()
+        if edge_index.dtype != torch.long:
+            edge_index = edge_index.long()
+        edge_weight_e3 = edge_weight.transpose(0, 1).contiguous()
+        edge_weight_e3 = edge_weight_e3.detach().requires_grad_(True)
+        edge_energy = self.repulsive(Z, edge_index, edge_weight_e3)
+        repulsive_energy = 0.5 * edge_energy.sum()
+        gradient = torch.autograd.grad(
+            [repulsive_energy], [edge_weight_e3], create_graph=True
+        )[0]
+        assert gradient is not None
+        gradient = gradient.detach()
+        force_i = torch.zeros(
+            (Z.shape[0], 3), dtype=gradient.dtype, device=gradient.device
+        )
+        force_j = torch.zeros_like(force_i)
+        force_i = torch.index_add(force_i, 0, edge_index[0], gradient)
+        force_j = torch.index_add(force_j, 0, edge_index[1], -gradient)
+        repulsive_forces = (force_i + force_j).transpose(0, 1).contiguous()
+        return (
+            base_energy + repulsive_energy,
+            base_forces + repulsive_forces,
+        )
 
 
 class PainnMDCSRMessageLayer(torch.nn.Module):
@@ -924,6 +1186,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cpu", help="Device used while exporting, default: cpu")
     parser.add_argument("--energy-baseline-json", type=Path, default=None)
     parser.add_argument(
+        "--repulsive-baseline-json",
+        type=Path,
+        default=None,
+        help="Fixed repulsive pair-potential JSON composed into every MD path.",
+    )
+    parser.add_argument(
+        "--short-range-gate-json",
+        type=Path,
+        default=None,
+        help=(
+            "Fixed pair-message gate JSON for inference-only safety. "
+            "Currently supported by the paired/shared MD_CUDA path."
+        ),
+    )
+    parser.add_argument(
         "--forward-mode",
         choices=("md", "legacy"),
         default="md",
@@ -984,6 +1261,8 @@ def main() -> int:
         sys.path.insert(0, str(args.simplegnn_root.resolve()))
 
     from simplegnn.painn import Painn
+    from simplegnn.repulsive import RepulsivePairPotential
+    from simplegnn.short_range_gate import ShortRangePairMessageGate
 
     device = torch.device(args.device)
     radial_kwargs = _parse_radial_kwargs(args.radial_kwargs_json)
@@ -1015,6 +1294,19 @@ def main() -> int:
         raise ValueError("--filter-projection stacked requires --geometry-mode shared")
     if args.force_output == "pair_gradient" and args.edge_layout != "md_cuda_paired":
         raise ValueError("--force-output pair_gradient requires --edge-layout md_cuda_paired")
+    if (
+        args.short_range_gate_json is not None
+        and args.edge_layout != "md_cuda_paired"
+    ):
+        raise ValueError(
+            "--short-range-gate-json currently requires "
+            "--edge-layout md_cuda_paired"
+        )
+    short_range_gate = None
+    if args.short_range_gate_json is not None:
+        short_range_gate = ShortRangePairMessageGate.from_json(
+            args.short_range_gate_json
+        )
     if args.aggregation_mode == "csr":
         wrapper = PainnMDCSRInferenceWrapper(base, e0_lookup).to(device).eval()
     elif args.edge_layout == "md_cuda_paired":
@@ -1023,8 +1315,12 @@ def main() -> int:
             base,
             e0_lookup,
             stacked_filters=args.filter_projection == "stacked",
-            return_pair_gradient=args.force_output == "pair_gradient",
+            return_pair_gradient=(
+                args.force_output == "pair_gradient"
+                or args.repulsive_baseline_json is not None
+            ),
             validate_layout=args.validate_pair_layout,
+            short_range_gate=short_range_gate,
         ).to(device).eval()
     elif args.geometry_mode == "shared":
         _validate_shared_geometry(base)
@@ -1037,6 +1333,25 @@ def main() -> int:
         wrapper = PainnMDInferenceWrapper(base, e0_lookup).to(device).eval()
     else:
         wrapper = PainnMDNNPWrapper(base, e0_lookup).to(device).eval()
+    if args.repulsive_baseline_json is not None:
+        repulsive_source = RepulsivePairPotential.from_json(
+            args.repulsive_baseline_json
+        )
+        repulsive_kernel = RepulsiveMDKernel(repulsive_source)
+        if args.aggregation_mode == "csr":
+            wrapper = PainnMDCSRRepulsiveWrapper(
+                wrapper, repulsive_kernel
+            ).to(device).eval()
+        else:
+            wrapper = PainnMDRepulsiveWrapper(
+                wrapper,
+                repulsive_kernel,
+                paired=args.edge_layout == "md_cuda_paired",
+                return_pair_gradient=args.force_output == "pair_gradient",
+                base_output_is_pair_gradient=(
+                    args.edge_layout == "md_cuda_paired"
+                ),
+            ).to(device).eval()
     scripted = torch.jit.script(wrapper)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)

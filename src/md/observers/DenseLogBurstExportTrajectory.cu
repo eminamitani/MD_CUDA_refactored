@@ -112,6 +112,10 @@ void DenseLogBurstExportTrajectory::output(State& state) {
     }
 }
 
+void DenseLogBurstExportTrajectory::finalize(State&) {
+    exporter.finalize();
+}
+
 std::tuple<bool, DenseLogBurstExportTrajectory::SampleType, std::optional<long long>, std::optional<int>>
 DenseLogBurstExportTrajectory::should_emit(long long relative_step) {
     if (relative_step <= 0) {

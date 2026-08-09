@@ -21,10 +21,17 @@ namespace md::checkpoint {
         std::string mode = "off";
         std::filesystem::path directory;
         double checkpoint_interval_seconds = 3600.0;
+        std::int64_t checkpoint_interval_steps = 0;
         double max_walltime_seconds = 244800.0;
         std::int64_t poll_interval_steps = 1000;
         int keep_generations = 2;
         bool strict_compatibility = true;
+        bool checkpoint_on_phase_end = false;
+        bool checkpoint_on_completion = false;
+        bool checkpoint_on_signal = true;
+        bool checkpoint_on_walltime_stop = true;
+        bool protect_phase_end_and_completion = false;
+        bool allow_target_extension = false;
 
         bool enabled() const { return mode != "off"; }
         static RestartConfig from_json(const nlohmann::json& setting);
@@ -47,7 +54,8 @@ namespace md::checkpoint {
                 RestartConfig config,
                 std::filesystem::path setting_path,
                 std::filesystem::path model_path,
-                std::array<std::array<float, 3>, 3> lattice
+                std::array<std::array<float, 3>, 3> lattice,
+                int workflow_step_index
             );
 
             static std::optional<CheckpointRecord> discover(const RestartConfig& config);
@@ -59,7 +67,9 @@ namespace md::checkpoint {
                 Observer& observer,
                 int workflow_step_index,
                 const std::string& workflow_step_name,
-                std::int64_t target_step
+                std::int64_t target_step,
+                const std::vector<std::string>& reasons = {},
+                bool protected_generation = false
             );
 
             CheckpointLoadResult load(
@@ -81,6 +91,7 @@ namespace md::checkpoint {
 
             const RestartConfig& config() const { return config_; }
             const std::string& config_sha256() const { return config_sha256_; }
+            const std::string& physics_config_sha256() const { return physics_config_sha256_; }
             const std::string& model_sha256() const { return model_sha256_; }
 
         private:
@@ -89,6 +100,7 @@ namespace md::checkpoint {
             std::filesystem::path model_path_;
             std::array<std::array<float, 3>, 3> lattice_;
             std::string config_sha256_;
+            std::string physics_config_sha256_;
             std::string model_sha256_;
             std::string executable_sha256_;
 

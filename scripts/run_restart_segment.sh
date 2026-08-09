@@ -8,10 +8,20 @@ set -euo pipefail
 SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_ROOT="${RUN_ROOT:-$(pwd)}"
 MODEL_PATH="${MODEL_PATH:-}"
-COMPLETE_MARKER="${COMPLETE_MARKER:-$RUN_ROOT/COMPLETE.json}"
-CONTINUE_MARKER="${CONTINUE_MARKER:-$RUN_ROOT/CONTINUE_READY.json}"
 MD_LOG="${MD_LOG:-$RUN_ROOT/md.segment.${PBS_JOBID:-${JOB_ID:-manual}}.log}"
 EXPECTED_TARGET_STEP="${EXPECTED_TARGET_STEP:-}"
+ALLOW_TARGET_EXTENSION="${ALLOW_TARGET_EXTENSION:-0}"
+REQUIRE_COMPLETION_CHECKPOINT="${REQUIRE_COMPLETION_CHECKPOINT:-0}"
+
+if [[ -n "$EXPECTED_TARGET_STEP" ]]; then
+  default_complete_marker="$RUN_ROOT/TARGET_COMPLETE.step${EXPECTED_TARGET_STEP}.json"
+  default_continue_marker="$RUN_ROOT/CONTINUE_READY.step${EXPECTED_TARGET_STEP}.json"
+else
+  default_complete_marker="$RUN_ROOT/COMPLETE.json"
+  default_continue_marker="$RUN_ROOT/CONTINUE_READY.json"
+fi
+COMPLETE_MARKER="${COMPLETE_MARKER:-$default_complete_marker}"
+CONTINUE_MARKER="${CONTINUE_MARKER:-$default_continue_marker}"
 
 mkdir -p "$RUN_ROOT" "$CHECKPOINT_DIR"
 
@@ -56,21 +66,28 @@ validator=(
 if [[ -n "$MODEL_PATH" ]]; then
   validator+=(--model "$MODEL_PATH")
 fi
+if [[ -n "$EXPECTED_TARGET_STEP" ]]; then
+  validator+=(--target-step "$EXPECTED_TARGET_STEP")
+fi
+if [[ "$ALLOW_TARGET_EXTENSION" == "1" ]]; then
+  validator+=(--allow-target-extension)
+fi
 
 if [[ "$md_rc" -eq 75 ]]; then
   "${validator[@]}" --require
-  python3 - "$CONTINUE_MARKER" "$MD_LOG" "$md_rc" <<'PY'
+  python3 - "$CONTINUE_MARKER" "$MD_LOG" "$md_rc" "$EXPECTED_TARGET_STEP" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-path, log, returncode = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+path, log, returncode, target = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3]), sys.argv[4]
 path.write_text(json.dumps({
     "status": "continue_ready",
     "created_at": datetime.now(timezone.utc).isoformat(),
     "md_log": log,
     "md_returncode": returncode,
+    "target_step": int(target) if target else None,
 }, indent=2) + "\n")
 PY
   echo "CONTINUE_READY"
@@ -87,6 +104,9 @@ if [[ -s "$CHECKPOINT_DIR/segment_manifest.json" ]]; then
     "$CHECKPOINT_DIR/segment_manifest.json" \
     --output "$RUN_ROOT/segment_validation.json"
 fi
+if [[ "$REQUIRE_COMPLETION_CHECKPOINT" == "1" ]]; then
+  "${validator[@]}" --require
+fi
 if [[ -n "$EXPECTED_TARGET_STEP" ]]; then
   python3 - "$CHECKPOINT_DIR/segment_manifest.json" "$EXPECTED_TARGET_STEP" <<'PY'
 import json
@@ -99,18 +119,19 @@ if not segments or max(int(item["end_step"]) for item in segments) != expected:
     raise SystemExit(f"completed MD did not reach target step {expected}")
 PY
 fi
-python3 - "$COMPLETE_MARKER" "$MD_LOG" <<'PY'
+python3 - "$COMPLETE_MARKER" "$MD_LOG" "$EXPECTED_TARGET_STEP" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-path, log = Path(sys.argv[1]), sys.argv[2]
+path, log, target = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
 path.write_text(json.dumps({
     "status": "complete",
     "created_at": datetime.now(timezone.utc).isoformat(),
     "md_log": log,
     "md_returncode": 0,
+    "target_step": int(target) if target else None,
 }, indent=2) + "\n")
 PY
 rm -f "$CONTINUE_MARKER"

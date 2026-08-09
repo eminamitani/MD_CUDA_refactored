@@ -25,7 +25,11 @@ namespace md::integrators {
             CheckpointBytes save_checkpoint(State& state) const override;
             void load_checkpoint(State& state, const CheckpointBytes& data) override;
         
-            void init(const State& satate, unsigned long long seed);
+            void init(
+                const State& state,
+                unsigned long long seed,
+                bool initialize_rng_state = true
+            );
             
         private:
             float gamma;

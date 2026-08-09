@@ -53,6 +53,93 @@ def test_checkpoint_falls_back_from_corrupt_latest(tmp_path: Path) -> None:
     assert len(errors) == 1
 
 
+def test_physics_config_hash_ignores_target_and_restart_controls(tmp_path: Path) -> None:
+    module = load_script("validate_md_checkpoint.py")
+    config = {
+        "meta": {"unit": "metal"},
+        "steps": [
+            {
+                "name": "production",
+                "simulation": {
+                    "dt": 1.0,
+                    "simulation_time": 5_000_000.0,
+                    "ensemble": {"type": "NVT", "temperature": 800.0},
+                    "restart": {
+                        "mode": "auto",
+                        "max_walltime_seconds": 244800,
+                    },
+                },
+            },
+            {
+                "name": "followup",
+                "simulation": {
+                    "dt": 1.0,
+                    "simulation_time": 1000.0,
+                    "ensemble": {"type": "NVE"},
+                },
+            },
+        ],
+    }
+    first = tmp_path / "first.json"
+    first.write_text(json.dumps(config))
+    first_hash = module.physics_config_sha256(first, 0)
+
+    config["steps"][0]["simulation"]["simulation_time"] = 10_000_000.0
+    config["steps"][0]["simulation"]["restart"]["max_walltime_seconds"] = 1200
+    second = tmp_path / "second.json"
+    second.write_text(json.dumps(config))
+    assert module.physics_config_sha256(second, 0) == first_hash
+
+    config["steps"][1]["simulation"]["simulation_time"] = 2000.0
+    inactive_changed = tmp_path / "inactive_changed.json"
+    inactive_changed.write_text(json.dumps(config))
+    assert module.physics_config_sha256(inactive_changed, 0) != first_hash
+    config["steps"][1]["simulation"]["simulation_time"] = 1000.0
+
+    config["steps"][0]["simulation"]["ensemble"]["temperature"] = 900.0
+    third = tmp_path / "third.json"
+    third.write_text(json.dumps(config))
+    assert module.physics_config_sha256(third, 0) != first_hash
+
+
+def test_checkpoint_target_may_only_extend_monotonically(tmp_path: Path) -> None:
+    module = load_script("validate_md_checkpoint.py")
+    payload = b"state"
+    stem = "checkpoint.step00000000005000.segment0000.g1"
+    (tmp_path / f"{stem}.bin").write_bytes(payload)
+    (tmp_path / f"{stem}.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "payload_file": f"{stem}.bin",
+                "payload_sha256": hashlib.sha256(payload).hexdigest(),
+                "payload_size": len(payload),
+                "physics_config_sha256": "a" * 64,
+                "current_steps": 5000,
+                "target_step": 10000,
+            }
+        )
+    )
+    selected, errors = module.discover_latest_valid(
+        tmp_path,
+        expected_physics_config_sha256="a" * 64,
+        expected_target_step=20000,
+        allow_target_extension=True,
+    )
+    assert selected is not None
+    assert errors == []
+
+    selected, errors = module.discover_latest_valid(
+        tmp_path,
+        expected_physics_config_sha256="a" * 64,
+        expected_target_step=9000,
+        allow_target_extension=True,
+    )
+    assert selected is None
+    assert len(errors) == 1
+    assert "not a monotonic extension" in errors[0]["error"]
+
+
 def write_frame(path: Path, step: int, segment: int, x: float, mode: str = "a") -> None:
     with path.open(mode) as handle:
         handle.write("1\n")

@@ -102,21 +102,47 @@ denotes the total phase duration instead of a duration to append:
 "restart": {
   "mode": "auto",
   "directory": "./checkpoints",
-  "checkpoint_interval_seconds": 3600,
+  "save_checkpoint": {
+    "interval_steps": 1000000,
+    "interval_seconds": 3600,
+    "on_phase_end": true,
+    "on_completion": true,
+    "on_signal": true,
+    "on_walltime_stop": true,
+    "protect_phase_end_and_completion": true
+  },
   "max_walltime_seconds": 244800,
   "poll_interval_steps": 1000,
   "keep_generations": 2,
-  "strict_compatibility": true
+  "strict_compatibility": true,
+  "allow_target_extension": true
 }
 ```
 
 `mode` may be `off`, `auto`, or `require`. Checkpoints are written only after a
-complete integration step and observer output. The binary payload contains the
-MD state plus Nose-Hoover, Bussi, Langevin/cuRAND, and stateful observer data.
+complete integration step and observer output. `interval_steps` is exact;
+wall-clock triggers are evaluated at `poll_interval_steps`. A step/time
+checkpoint does not stop MD. Wall-time or signal checkpoints stop with code
+`75`; phase/target completion checkpoints return normally with code `0`.
+Multiple triggers at one step produce one checkpoint carrying all reasons.
+The binary payload contains the MD state plus Nose-Hoover, Bussi,
+Langevin/cuRAND, and stateful observer data.
+Restart construction allocates the required components but does not initialize
+velocities, reset thermostat state, or reseed cuRAND before loading that data.
 The JSON sidecar records SHA-256, model/config/build identity, CUDA/cuRAND
 compatibility, workflow phase, target step, and segment provenance. The newest
-two generations are retained; a corrupt newest generation falls back to the
+two unprotected recovery generations are retained; phase/target milestones may
+be protected from rotation. A corrupt newest generation falls back to the
 previous valid generation.
+
+With `allow_target_extension: true`, increasing `simulation_time` continues
+from a compatible checkpoint instead of requiring a synthetic long initial
+target. Target reduction is rejected. Physics-defining configuration, model,
+binary, lattice, component IDs, and CUDA/cuRAND compatibility remain strict.
+For `dense_log_burst_export_trajectory`, set a numeric `dense_until` when target
+extension is enabled because the automatic schedule depends on the original
+target length. The legacy top-level `checkpoint_interval_seconds` remains
+accepted for existing configurations.
 
 Trajectory files are never appended. When restart is enabled, an observer
 `output_path` is converted to `name.segment0000.extxyz` by default. An explicit
@@ -138,6 +164,11 @@ writes a validated continuation checkpoint and exits with code `75`.
 segment only after validating the checkpoint. On RCCS,
 `scripts/submit_restart_chain.sh` pre-submits a finite
 `jsub -W depend=afterok:<jobid>` chain; compute nodes do not self-submit.
+Set `EXPECTED_TARGET_STEP` and `ALLOW_TARGET_EXTENSION=1` in the wrapper for
+an extendable campaign. Completion and continuation markers then include the
+target step, so a validated 5 ns marker cannot suppress a later 10 ns run.
+Set `REQUIRE_COMPLETION_CHECKPOINT=1` when the configuration enables
+`on_completion`.
 
 Supported atom initialization:
 
@@ -224,6 +255,12 @@ Supported observers include:
 - `target_temperature_export`: write structures when a linear temperature
   schedule crosses target temperatures
 
+A simulation step may use either the legacy singular `observer` or a new
+ordered `observers` array. Every array entry requires a unique `id`; duplicate
+IDs and duplicate `output_path` values are rejected. The composite checkpoint
+stores child ID, order, sampling/field contract, checkpoint type, and payload,
+so a restart cannot silently add, remove, reorder, or retune a stream.
+
 Trajectory-writing observers accept an optional field-selection block:
 
 ```json
@@ -254,10 +291,32 @@ velocities in SoA xyz layout. Each chunk is first written with a `.partial`
 suffix, then atomically renamed and added to the manifest. The format requires
 `linear_export_trajectory`, wrapped positions, velocities, no force field, and
 a positive `chunk_frames`. Restarted runs retain the existing segment-manifest
-contract: each segment points to its own completed binary manifest.
+contract. Multi-observer segments expose a `trajectories` object keyed by
+observer ID; a legacy single stream also retains the singular `trajectory`
+key.
+
+Nonuniform or uniform position streams can use generic binary v2:
+
+```json
+"trajectory": {
+  "mode": "msd",
+  "fields": ["position", "image"],
+  "coordinates": "wrapped",
+  "format": "trajectory_binary_v2",
+  "chunk_frames": 256
+}
+```
+
+`trajectory_binary_v2` stores a 48-byte frame header with production/workflow
+step, time, sample type, burst ID/index, and energy-valid flag. Selected arrays
+follow in SoA xyz layout; `position` is float32 and `image` is int32. The JSON
+manifest records atomic numbers, cell, field mask/dtypes, record layout, frame
+and step ranges, and the SHA-256 of every completed chunk. A `.partial` chunk
+is never listed as valid. Exact unwrapped coordinates are reconstructed as
+wrapped position plus image counters times the cell.
 
 `fields`, when present, overrides the preset field list.  Species is always
-written.  Supported fields are `position`, `velocity`, `force`, and the global
+written.  Supported fields are `position`, `image`, `velocity`, `force`, and the global
 `energy`.  The presets are:
 
 - `legacy`: position, force, and energy; preserves `is_unwrap`

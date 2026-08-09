@@ -48,11 +48,20 @@
         "restart": {
           "mode": "auto",
           "directory": "outputs/checkpoint_smoke/checkpoints",
-          "checkpoint_interval_seconds": 3600,
+          "save_checkpoint": {
+            "interval_steps": 8,
+            "interval_seconds": 3600,
+            "on_phase_end": true,
+            "on_completion": true,
+            "on_signal": true,
+            "on_walltime_stop": true,
+            "protect_phase_end_and_completion": true
+          },
           "max_walltime_seconds": 1e-09,
           "poll_interval_steps": 8,
           "keep_generations": 2,
-          "strict_compatibility": true
+          "strict_compatibility": true,
+          "allow_target_extension": true
         },
         "use_graph": false
       },

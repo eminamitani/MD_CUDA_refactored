@@ -34,7 +34,11 @@ namespace md::thermostats {
             CheckpointBytes save_checkpoint(State& state) const override;
             void load_checkpoint(State& state, const CheckpointBytes& data) override;
 
-            void init(State& state, unsigned long long seed);
+            void init(
+                State& state,
+                unsigned long long seed,
+                bool initialize_rng_state = true
+            );
         private:
             float tau;
             int dof;

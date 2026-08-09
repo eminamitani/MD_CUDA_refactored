@@ -59,7 +59,14 @@ namespace md::utils {
             void build_state(const nlohmann::json& a_setting);
             void build_cell(const nlohmann::json& c_setting);
             void build_observer(const nlohmann::json& o_setting, long long total_steps = -1);
-            void build_ensemble(const nlohmann::json& e_setting);
+            std::unique_ptr<Observer> make_observer(
+                const nlohmann::json& o_setting,
+                long long total_steps = -1
+            );
+            void build_ensemble(
+                const nlohmann::json& e_setting,
+                bool initialize_dynamic_state = true
+            );
             void build_interaction(const nlohmann::json& i_setting);
             void build_checker(const nlohmann::json& ch_setting);
             void build_minimizer(const nlohmann::json & mi_setting);

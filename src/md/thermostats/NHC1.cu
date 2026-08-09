@@ -96,19 +96,21 @@ NHC1::~NHC1() {
     cudaFree(c_state.scaling_factor);
 }
 
-void NHC1::init(State& state) {
+void NHC1::init(State& state, bool initialize_chain_state) {
     this->dof = static_cast<float>(configured_dof > 0 ? configured_dof : state.thermostat_dof);
     if (this->dof <= 0.0f) {
         this->dof = 3.0f * state.n_atoms;
     }
     this->calculator = std::make_unique<KinEnergyCalculator>(state);
 
-    float zero = 0.0f;
-    cudaMemcpy(c_state.pos, &zero, sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(c_state.vel, &zero, sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(c_state.force, &zero, sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(c_state.mass, &zero, sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(c_state.scaling_factor, &zero, sizeof(float), cudaMemcpyHostToDevice);
+    if (initialize_chain_state) {
+        float zero = 0.0f;
+        cudaMemcpy(c_state.pos, &zero, sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(c_state.vel, &zero, sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(c_state.force, &zero, sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(c_state.mass, &zero, sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(c_state.scaling_factor, &zero, sizeof(float), cudaMemcpyHostToDevice);
+    }
 }
 
 void NHC1::stepOne(State& state) {

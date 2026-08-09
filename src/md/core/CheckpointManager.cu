@@ -13,6 +13,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
@@ -283,6 +284,38 @@ namespace {
         return path.empty() ? std::string() : md::checkpoint::sha256_file(path);
     }
 
+    std::string sha256_text(const std::string& text) {
+        Sha256 hash;
+        if (!text.empty()) {
+            hash.update(
+                reinterpret_cast<const std::uint8_t*>(text.data()),
+                text.size()
+            );
+        }
+        return hash.finish();
+    }
+
+    std::string physics_config_hash(const fs::path& path, int workflow_step_index) {
+        if (path.empty()) return {};
+        std::ifstream input(path);
+        if (!input) {
+            throw std::runtime_error("Could not open configuration for physics hash: " + path.string());
+        }
+        json setting = json::parse(input);
+        if (setting.contains("steps") && setting.at("steps").is_array()) {
+            for (std::size_t index = 0; index < setting["steps"].size(); ++index) {
+                auto& step = setting["steps"].at(index);
+                if (!step.contains("simulation") || !step.at("simulation").is_object()) continue;
+                auto& simulation = step["simulation"];
+                if (static_cast<int>(index) == workflow_step_index) {
+                    simulation.erase("simulation_time");
+                }
+                simulation.erase("restart");
+            }
+        }
+        return sha256_text(setting.dump());
+    }
+
     bool is_sidecar_name(const fs::path& path) {
         const std::string name = path.filename().string();
         return name.rfind("checkpoint.", 0) == 0 && path.extension() == ".json";
@@ -358,13 +391,35 @@ namespace md::checkpoint {
             throw std::runtime_error("restart.mode must be off, auto, or require.");
         }
         result.directory = setting.value("directory", std::string("checkpoints"));
-        result.checkpoint_interval_seconds = setting.value("checkpoint_interval_seconds", 3600.0);
+        const json save_setting = setting.value("save_checkpoint", json::object());
+        if (!save_setting.is_object()) {
+            throw std::runtime_error("restart.save_checkpoint must be an object.");
+        }
+        result.checkpoint_interval_seconds = save_setting.value(
+            "interval_seconds",
+            setting.value("checkpoint_interval_seconds", 3600.0)
+        );
+        result.checkpoint_interval_steps = save_setting.value("interval_steps", std::int64_t{0});
+        result.checkpoint_on_phase_end = save_setting.value("on_phase_end", false);
+        result.checkpoint_on_completion = save_setting.value("on_completion", false);
+        result.checkpoint_on_signal = save_setting.value("on_signal", true);
+        result.checkpoint_on_walltime_stop = save_setting.value("on_walltime_stop", true);
+        result.protect_phase_end_and_completion = save_setting.value(
+            "protect_phase_end_and_completion",
+            false
+        );
         result.max_walltime_seconds = setting.value("max_walltime_seconds", 244800.0);
         result.poll_interval_steps = setting.value("poll_interval_steps", std::int64_t{1000});
         result.keep_generations = setting.value("keep_generations", 2);
         result.strict_compatibility = setting.value("strict_compatibility", true);
-        if (result.checkpoint_interval_seconds <= 0.0 || result.max_walltime_seconds <= 0.0) {
-            throw std::runtime_error("restart time intervals must be positive.");
+        result.allow_target_extension = setting.value("allow_target_extension", false);
+        if (result.checkpoint_interval_seconds < 0.0 || result.checkpoint_interval_steps < 0) {
+            throw std::runtime_error("checkpoint intervals must be non-negative.");
+        }
+        if (result.checkpoint_on_walltime_stop && result.max_walltime_seconds <= 0.0) {
+            throw std::runtime_error(
+                "restart.max_walltime_seconds must be positive when on_walltime_stop is enabled."
+            );
         }
         if (result.poll_interval_steps <= 0 || result.keep_generations < 2) {
             throw std::runtime_error("restart.poll_interval_steps must be positive and keep_generations must be >= 2.");
@@ -390,12 +445,14 @@ namespace md::checkpoint {
         RestartConfig config,
         fs::path setting_path,
         fs::path model_path,
-        std::array<std::array<float, 3>, 3> lattice
+        std::array<std::array<float, 3>, 3> lattice,
+        int workflow_step_index
     ) : config_(std::move(config)),
         setting_path_(std::move(setting_path)),
         model_path_(std::move(model_path)),
         lattice_(std::move(lattice)),
         config_sha256_(zero_or_hash(setting_path_)),
+        physics_config_sha256_(physics_config_hash(setting_path_, workflow_step_index)),
         model_sha256_(zero_or_hash(model_path_)) {
         const std::string executable = executable_path();
         executable_sha256_ = executable.empty() ? std::string() : sha256_file(executable);
@@ -428,7 +485,9 @@ namespace md::checkpoint {
         Observer& observer,
         int workflow_step_index,
         const std::string& workflow_step_name,
-        std::int64_t target_step
+        std::int64_t target_step,
+        const std::vector<std::string>& reasons,
+        bool protected_generation
     ) {
         MD_CUDA_CHECK(cudaStreamSynchronize(state.stream));
         const std::size_t n = static_cast<std::size_t>(state.n_atoms);
@@ -515,10 +574,14 @@ namespace md::checkpoint {
             {"dt", state.dt},
             {"lattice", lattice_},
             {"config_sha256", config_sha256_},
+            {"execution_config_sha256", config_sha256_},
+            {"physics_config_sha256", physics_config_sha256_},
             {"model_sha256", model_sha256_},
             {"executable_sha256", executable_sha256_},
             {"component_ids", component_ids},
-            {"runtime_compatibility", runtime_compatibility()}
+            {"runtime_compatibility", runtime_compatibility()},
+            {"checkpoint_reasons", reasons},
+            {"protected_generation", protected_generation}
         };
         atomic_write_text(sidecar_path, metadata.dump(2) + "\n");
         const json latest = {
@@ -555,13 +618,52 @@ namespace md::checkpoint {
         if (std::fabs(metadata.at("dt").get<float>() - state.dt) > 1.0e-8f) {
             throw std::runtime_error("Checkpoint dt mismatch.");
         }
-        if (metadata.at("target_step").get<std::int64_t>() != expected_target_step) {
+        const std::int64_t saved_target_step = metadata.at("target_step").get<std::int64_t>();
+        const std::int64_t saved_current_step = metadata.at("current_steps").get<std::int64_t>();
+        if (config_.allow_target_extension) {
+            if (expected_target_step < saved_target_step || expected_target_step < saved_current_step) {
+                throw std::runtime_error(
+                    "Checkpoint target_step may only be extended monotonically."
+                );
+            }
+        } else if (saved_target_step != expected_target_step) {
             throw std::runtime_error("Checkpoint target_step mismatch.");
         }
         if (config_.strict_compatibility) {
-            expect_equal("config_sha256", metadata.at("config_sha256").get<std::string>(), config_sha256_);
+            if (config_.allow_target_extension) {
+                if (!metadata.contains("physics_config_sha256")) {
+                    throw std::runtime_error(
+                        "Checkpoint predates physics_config_sha256 and cannot be target-extended safely."
+                    );
+                }
+                expect_equal(
+                    "physics_config_sha256",
+                    metadata.at("physics_config_sha256").get<std::string>(),
+                    physics_config_sha256_
+                );
+            } else {
+                expect_equal(
+                    "config_sha256",
+                    metadata.at("config_sha256").get<std::string>(),
+                    config_sha256_
+                );
+            }
             expect_equal("model_sha256", metadata.at("model_sha256").get<std::string>(), model_sha256_);
-            expect_equal("executable_sha256", metadata.at("executable_sha256").get<std::string>(), executable_sha256_);
+            const std::string saved_executable_sha =
+                metadata.at("executable_sha256").get<std::string>();
+            if (saved_executable_sha != executable_sha256_) {
+                const char* migration_from = std::getenv(
+                    "MD_CUDA_RESTART_MIGRATION_FROM_EXECUTABLE_SHA256"
+                );
+                if (migration_from == nullptr || saved_executable_sha != migration_from) {
+                    throw std::runtime_error(
+                        "Checkpoint compatibility mismatch for executable_sha256"
+                    );
+                }
+                std::cerr
+                    << "WARNING: explicitly authorized checkpoint executable migration from "
+                    << saved_executable_sha << " to " << executable_sha256_ << std::endl;
+            }
             expect_equal("lattice", metadata.at("lattice"), json(lattice_));
             expect_equal("integrator", metadata.at("component_ids").at("integrator").get<std::string>(), integrator.checkpoint_id());
             expect_equal(
@@ -674,13 +776,16 @@ namespace md::checkpoint {
 
     void CheckpointManager::prune_old_generations() const {
         auto candidates = candidate_sidecars(config_.directory);
-        if (static_cast<int>(candidates.size()) <= config_.keep_generations) return;
-        for (std::size_t i = static_cast<std::size_t>(config_.keep_generations); i < candidates.size(); ++i) {
+        int unprotected_seen = 0;
+        for (const auto& candidate : candidates) {
             try {
-                std::ifstream input(candidates[i]);
+                std::ifstream input(candidate);
                 json metadata = json::parse(input);
+                if (metadata.value("protected_generation", false)) continue;
+                ++unprotected_seen;
+                if (unprotected_seen <= config_.keep_generations) continue;
                 fs::remove(config_.directory / metadata.at("payload_file").get<std::string>());
-                fs::remove(candidates[i]);
+                fs::remove(candidate);
             } catch (const std::exception&) {
                 // Keep malformed generations for manual diagnosis rather than deleting unknown files.
             }

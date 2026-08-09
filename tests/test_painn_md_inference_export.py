@@ -16,6 +16,11 @@ if TORCH_SPEC is not None:
 
     sys.path.insert(0, str(SIMPLEGNN_ROOT))
     from simplegnn.painn import Painn
+    from simplegnn.repulsive import RepulsivePairPotential
+    from simplegnn.short_range_gate import (
+        PainnWithInferenceGate,
+        ShortRangePairMessageGate,
+    )
 
     sys.path.insert(0, str(ROOT / "scripts"))
     from export_simplegnn_painn_for_md import (
@@ -24,7 +29,10 @@ if TORCH_SPEC is not None:
         PainnMDInferenceWrapper,
         PainnMDNNPWrapper,
         PainnMDPairedInferenceWrapper,
+        PainnMDRepulsiveWrapper,
+        PainnMDCSRRepulsiveWrapper,
         PainnMDSharedGeometryInferenceWrapper,
+        RepulsiveMDKernel,
         _validate_shared_geometry,
     )
 else:  # pragma: no cover - depends on the optional local ML runtime.
@@ -60,6 +68,15 @@ class PainnMDInferenceExportTests(unittest.TestCase):
         self.baseline = torch.zeros(119, dtype=torch.float32)
         self.baseline[3] = 1.5
         self.baseline[8] = -0.5
+        self.repulsive = RepulsivePairPotential(
+            {
+                "schema_version": 1,
+                "family": "inverse_power",
+                "anchor_fraction": 0.8,
+                "anchor_force_eV_per_A": 50.0,
+                "pairs": {"3-8": {"cutoff_A": 1.65}},
+            }
+        ).eval()
 
     def csr_graph(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         order = torch.argsort(self.edge_index[0], stable=True)
@@ -145,6 +162,62 @@ class PainnMDInferenceExportTests(unittest.TestCase):
 
         self.assertLessEqual(float(torch.abs(directed_energy - paired_energy)), 1e-4)
         self.assertLessEqual(float(torch.max(torch.abs(directed_forces - paired_forces))), 1e-5)
+
+    def test_paired_short_range_gate_matches_simplegnn_gate(self) -> None:
+        edge_index, edge_weight = self.paired_graph()
+        gate = ShortRangePairMessageGate(
+            {
+                "schema_version": 1,
+                "kind": "pair_message_gate",
+                "transition": "quintic_smoothstep",
+                "pairs": {
+                    "3-8": {"off_A": 1.1, "full_A": 1.4},
+                    "3-14": {"off_A": 0.8, "full_A": 1.6},
+                    "8-14": {"off_A": 0.7, "full_A": 1.3},
+                },
+            }
+        ).eval()
+        simplegnn_gate = PainnWithInferenceGate(self.base, gate).eval()
+        reference_energy, reference_forces, _ = simplegnn_gate(
+            self.atomic_numbers,
+            edge_index,
+            edge_weight.transpose(0, 1).contiguous(),
+            batch=None,
+        )
+        paired = PainnMDPairedInferenceWrapper(
+            self.base,
+            torch.zeros_like(self.baseline),
+            short_range_gate=gate,
+            validate_layout=True,
+        ).eval()
+        paired_energy, paired_forces = paired(
+            self.atomic_numbers,
+            edge_index,
+            edge_weight,
+        )
+        self.assertLessEqual(
+            float(torch.abs(reference_energy - paired_energy)), 1e-4
+        )
+        self.assertLessEqual(
+            float(
+                torch.max(
+                    torch.abs(
+                        reference_forces.transpose(0, 1) - paired_forces
+                    )
+                )
+            ),
+            1e-5,
+        )
+        scripted = torch.jit.script(paired)
+        script_energy, script_forces = scripted(
+            self.atomic_numbers, edge_index, edge_weight
+        )
+        self.assertLessEqual(
+            float(torch.abs(paired_energy - script_energy)), 1e-4
+        )
+        self.assertLessEqual(
+            float(torch.max(torch.abs(paired_forces - script_forces))), 1e-5
+        )
 
     def test_directed_shared_geometry_matches_md_forward(self) -> None:
         directed = PainnMDInferenceWrapper(self.base, self.baseline).eval()
@@ -352,6 +425,142 @@ class PainnMDInferenceExportTests(unittest.TestCase):
 
         self.assertLessEqual(float(torch.abs(reference_energy - padded_energy)), 1e-6)
         self.assertLessEqual(float(torch.max(torch.abs(reference_forces - padded_forces))), 1e-6)
+
+    def test_repulsive_directed_wrapper_matches_simplegnn_total(self) -> None:
+        base_wrapper = PainnMDInferenceWrapper(self.base, self.baseline).eval()
+        wrapped = PainnMDRepulsiveWrapper(
+            base_wrapper, RepulsiveMDKernel(self.repulsive)
+        ).eval()
+        base_energy, base_forces = base_wrapper(
+            self.atomic_numbers, self.edge_index, self.edge_weight
+        )
+        rep_energy, rep_forces, _ = self.repulsive(
+            self.atomic_numbers,
+            self.edge_index,
+            self.edge_weight.transpose(0, 1),
+            batch=None,
+        )
+        total_energy, total_forces = wrapped(
+            self.atomic_numbers, self.edge_index, self.edge_weight
+        )
+        self.assertLessEqual(
+            float(torch.abs(total_energy - base_energy - rep_energy)), 1e-6
+        )
+        self.assertLessEqual(
+            float(
+                torch.max(
+                    torch.abs(
+                        total_forces - base_forces - rep_forces.transpose(0, 1)
+                    )
+                )
+            ),
+            1e-6,
+        )
+
+    def test_repulsive_paired_and_directed_wrappers_match(self) -> None:
+        edge_index, edge_weight = self.paired_graph()
+        directed = PainnMDRepulsiveWrapper(
+            PainnMDInferenceWrapper(self.base, self.baseline).eval(),
+            RepulsiveMDKernel(self.repulsive),
+        ).eval()
+        paired = PainnMDRepulsiveWrapper(
+            PainnMDPairedInferenceWrapper(self.base, self.baseline).eval(),
+            RepulsiveMDKernel(self.repulsive),
+            paired=True,
+        ).eval()
+        directed_energy, directed_forces = directed(
+            self.atomic_numbers, edge_index, edge_weight
+        )
+        paired_energy, paired_forces = paired(
+            self.atomic_numbers, edge_index, edge_weight
+        )
+        self.assertLessEqual(
+            float(torch.abs(directed_energy - paired_energy)), 1e-4
+        )
+        self.assertLessEqual(
+            float(torch.max(torch.abs(directed_forces - paired_forces))), 1e-5
+        )
+
+    def test_repulsive_pair_gradient_reconstructs_atom_forces(self) -> None:
+        edge_index, edge_weight = self.paired_graph()
+        atom_wrapper = PainnMDRepulsiveWrapper(
+            PainnMDPairedInferenceWrapper(
+                self.base, self.baseline, return_pair_gradient=True
+            ).eval(),
+            RepulsiveMDKernel(self.repulsive),
+            paired=True,
+            base_output_is_pair_gradient=True,
+        ).eval()
+        gradient_wrapper = PainnMDRepulsiveWrapper(
+            PainnMDPairedInferenceWrapper(
+                self.base, self.baseline, return_pair_gradient=True
+            ).eval(),
+            RepulsiveMDKernel(self.repulsive),
+            paired=True,
+            return_pair_gradient=True,
+            base_output_is_pair_gradient=True,
+        ).eval()
+        atom_energy, atom_forces = atom_wrapper(
+            self.atomic_numbers, edge_index, edge_weight
+        )
+        gradient_energy, pair_gradient = gradient_wrapper(
+            self.atomic_numbers, edge_index, edge_weight
+        )
+        pair_index = edge_index[:, : edge_index.shape[1] // 2]
+        reconstructed = torch.zeros(
+            (self.atomic_numbers.shape[0], 3), dtype=pair_gradient.dtype
+        )
+        reconstructed.index_add_(
+            0, pair_index[0], pair_gradient.transpose(0, 1)
+        )
+        reconstructed.index_add_(
+            0, pair_index[1], -pair_gradient.transpose(0, 1)
+        )
+        self.assertLessEqual(float(torch.abs(atom_energy - gradient_energy)), 1e-4)
+        self.assertLessEqual(
+            float(
+                torch.max(
+                    torch.abs(atom_forces - reconstructed.transpose(0, 1))
+                )
+            ),
+            1e-5,
+        )
+
+    def test_repulsive_csr_matches_scatter_and_scripts(self) -> None:
+        edge_index, edge_weight, offsets = self.csr_graph()
+        scatter = PainnMDRepulsiveWrapper(
+            PainnMDInferenceWrapper(self.base, self.baseline).eval(),
+            RepulsiveMDKernel(self.repulsive),
+        ).eval()
+        csr = PainnMDCSRRepulsiveWrapper(
+            PainnMDCSRInferenceWrapper(self.base, self.baseline).eval(),
+            RepulsiveMDKernel(self.repulsive),
+        ).eval()
+        scatter_energy, scatter_forces = scatter(
+            self.atomic_numbers, edge_index, edge_weight
+        )
+        scripted = torch.jit.script(csr)
+        csr_energy, csr_forces = scripted(
+            self.atomic_numbers, edge_index, edge_weight, offsets
+        )
+        self.assertLessEqual(float(torch.abs(scatter_energy - csr_energy)), 1e-4)
+        self.assertLessEqual(
+            float(torch.max(torch.abs(scatter_forces - csr_forces))), 1e-5
+        )
+
+    def test_repulsive_paired_wrapper_is_torchscript_compatible(self) -> None:
+        edge_index, edge_weight = self.paired_graph()
+        wrapped = PainnMDRepulsiveWrapper(
+            PainnMDPairedInferenceWrapper(self.base, self.baseline).eval(),
+            RepulsiveMDKernel(self.repulsive),
+            paired=True,
+        ).eval()
+        scripted = torch.jit.script(wrapped)
+        energy, forces = scripted(
+            self.atomic_numbers, edge_index, edge_weight
+        )
+        self.assertTrue(torch.isfinite(energy))
+        self.assertTrue(torch.isfinite(forces).all())
 
 
 if __name__ == "__main__":

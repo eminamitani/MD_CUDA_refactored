@@ -1,6 +1,7 @@
 #include <md/utils/SimulationRunner.hpp>
 #include <md/utils/initialize.cuh>
 #include <md/utils/CudaCheck.cuh>
+#include <md/utils/compute.cuh>
 
 #include <md/core/State.cuh>
 #include <md/core/CheckpointManager.cuh>
@@ -38,6 +39,8 @@
 #include <md/observers/LinearExportTrajectory.cuh>
 #include <md/observers/LogExportTrajectory.cuh>
 #include <md/observers/DenseLogBurstExportTrajectory.cuh>
+#include <md/observers/CompositeObserver.cuh>
+#include <md/observers/ThermoMonitorObserver.cuh>
 #include <md/observers/TargetTemperatureExporter.cuh>
 #include <md/convergence_checkers/MaxNorm.cuh>
 #include <md/energy_minimizers/FireMinimizer.cuh>
@@ -51,6 +54,8 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <unordered_set>
+#include <vector>
 
 using namespace md::utils;
 using namespace md;
@@ -84,10 +89,61 @@ namespace {
         return pattern;
     }
 
+    using SegmentedTrajectory = std::pair<std::string, std::string>;
+
+    bool is_trajectory_observer_type(const std::string& type) {
+        return type == "linear_export_trajectory" ||
+            type == "log_export_trajectory" ||
+            type == "dense_log_burst_export_trajectory" ||
+            type == "target_temperature_export";
+    }
+
+    std::vector<SegmentedTrajectory> segment_observer_outputs(
+        json& observer_setting,
+        int segment_id
+    ) {
+        std::vector<SegmentedTrajectory> outputs;
+        if (observer_setting.value("type", std::string()) == "composite") {
+            for (auto& child : observer_setting.at("observers")) {
+                auto child_outputs = segment_observer_outputs(child, segment_id);
+                outputs.insert(outputs.end(), child_outputs.begin(), child_outputs.end());
+            }
+            return outputs;
+        }
+        if (!observer_setting.contains("output_path")) return outputs;
+        const std::string id = observer_setting.value("id", "legacy");
+        const std::string original_path = observer_setting.at("output_path").get<string>();
+        const std::string pattern = observer_setting.value(
+            "segment_output_pattern",
+            segmented_output_pattern(original_path)
+        );
+        const std::string segment_path = format_segment_path(pattern, segment_id);
+        observer_setting["output_path"] = segment_path;
+        if (is_trajectory_observer_type(
+                observer_setting.value("type", std::string()))) {
+            outputs.emplace_back(id, segment_path);
+        }
+        return outputs;
+    }
+
+    bool has_auto_dense_until(const json& observer_setting) {
+        if (observer_setting.value("type", std::string()) == "composite") {
+            for (const auto& child : observer_setting.at("observers")) {
+                if (has_auto_dense_until(child)) return true;
+            }
+            return false;
+        }
+        if (observer_setting.value("type", std::string()) !=
+            "dense_log_burst_export_trajectory") return false;
+        return !observer_setting.contains("dense_until") ||
+            (observer_setting.at("dense_until").is_string() &&
+             observer_setting.at("dense_until").get<std::string>() == "auto");
+    }
+
     void update_segment_manifest(
         const std::filesystem::path& checkpoint_directory,
         int segment_id,
-        const std::string& trajectory_path,
+        const std::vector<SegmentedTrajectory>& trajectory_paths,
         const std::string& parent_checkpoint,
         std::int64_t start_step,
         std::int64_t end_step,
@@ -108,12 +164,19 @@ namespace {
         }
         json record = {
             {"segment_id", segment_id},
-            {"trajectory", std::filesystem::absolute(trajectory_path).string()},
             {"parent_checkpoint_id", parent_checkpoint},
             {"start_step", start_step},
             {"end_step", end_step},
             {"status", status}
         };
+        record["trajectories"] = json::object();
+        for (const auto& [id, path] : trajectory_paths) {
+            record["trajectories"][id] = std::filesystem::absolute(path).string();
+        }
+        if (trajectory_paths.size() == 1 && trajectory_paths.front().first == "legacy") {
+            record["trajectory"] =
+                std::filesystem::absolute(trajectory_paths.front().second).string();
+        }
         bool replaced = false;
         for (auto& existing : manifest["segments"]) {
             if (existing.value("segment_id", -1) == segment_id) {
@@ -198,40 +261,46 @@ namespace {
         spec.format = trajectory.value("format", "extxyz");
         if (
             spec.format != "extxyz" &&
-            spec.format != "transport_binary_v1"
+            spec.format != "transport_binary_v1" &&
+            spec.format != "trajectory_binary_v2"
         ) {
             throw std::runtime_error(
-                "trajectory.format supports extxyz or transport_binary_v1."
+                "trajectory.format supports extxyz, transport_binary_v1, or trajectory_binary_v2."
             );
         }
         spec.binary_chunk_frames = trajectory.value("chunk_frames", 256);
 
         if (spec.mode == "legacy") {
             spec.position = true;
+            spec.image = false;
             spec.velocity = false;
             spec.force = true;
             spec.energy = true;
             spec.unwrap = legacy_unwrap;
         } else if (spec.mode == "msd") {
             spec.position = true;
+            spec.image = false;
             spec.velocity = false;
             spec.force = false;
             spec.energy = false;
             spec.unwrap = true;
         } else if (spec.mode == "vdos") {
             spec.position = true;
+            spec.image = false;
             spec.velocity = true;
             spec.force = false;
             spec.energy = false;
             spec.unwrap = false;
         } else if (spec.mode == "active_learning") {
             spec.position = true;
+            spec.image = false;
             spec.velocity = false;
             spec.force = true;
             spec.energy = true;
             spec.unwrap = false;
         } else if (spec.mode == "transport_base") {
             spec.position = true;
+            spec.image = false;
             spec.velocity = true;
             spec.force = true;
             spec.energy = true;
@@ -253,12 +322,14 @@ namespace {
                 throw std::runtime_error("trajectory.fields must be an array.");
             }
             spec.position = false;
+            spec.image = false;
             spec.velocity = false;
             spec.force = false;
             spec.energy = false;
             for (const auto& field_value : trajectory.at("fields")) {
                 const string field = field_value.get<string>();
                 if (field == "position") spec.position = true;
+                else if (field == "image") spec.image = true;
                 else if (field == "velocity") spec.velocity = true;
                 else if (field == "force") spec.force = true;
                 else if (field == "energy") spec.energy = true;
@@ -277,6 +348,7 @@ namespace {
                 observer_type != "linear_export_trajectory" ||
                 !spec.position ||
                 !spec.velocity ||
+                spec.image ||
                 spec.force ||
                 spec.unwrap ||
                 spec.binary_chunk_frames <= 0
@@ -286,6 +358,17 @@ namespace {
                     "wrapped position and velocity, no force, and positive "
                     "trajectory.chunk_frames."
                 );
+            }
+        } else if (spec.format == "trajectory_binary_v2") {
+            if (!spec.position || spec.force || spec.unwrap ||
+                spec.binary_chunk_frames <= 0) {
+                throw std::runtime_error(
+                    "trajectory_binary_v2 requires wrapped position, no force, and "
+                    "positive trajectory.chunk_frames. Add field=image for exact unwrapping."
+                );
+            }
+            if (spec.image && !spec.position) {
+                throw std::runtime_error("trajectory field=image requires position.");
             }
         }
         return spec;
@@ -359,9 +442,16 @@ int SimulationRunner::run() {
         if (recorded_index != static_cast<int>(index)) {
             throw std::runtime_error("Checkpoint workflow_step_index does not match its configured step.");
         }
-        if (!resume_selection ||
-            record->metadata.at("generation").get<std::int64_t>() >
-            resume_selection->record.metadata.at("generation").get<std::int64_t>()) {
+        const int selected_index = resume_selection
+            ? resume_selection->record.metadata.at("workflow_step_index").get<int>()
+            : -1;
+        const std::int64_t selected_generation = resume_selection
+            ? resume_selection->record.metadata.at("generation").get<std::int64_t>()
+            : -1;
+        const std::int64_t candidate_generation =
+            record->metadata.at("generation").get<std::int64_t>();
+        if (!resume_selection || recorded_index > selected_index ||
+            (recorded_index == selected_index && candidate_generation > selected_generation)) {
             resume_selection = ResumeSelection{restart, *record};
         }
     }
@@ -386,8 +476,27 @@ int SimulationRunner::run() {
             state->current_steps = 0;
         }
 
+        const int observer_forms =
+            static_cast<int>(step.contains("observer")) +
+            static_cast<int>(step.contains("observers")) +
+            static_cast<int>(step.contains("output"));
+        if (observer_forms != 1) {
+            throw std::runtime_error(
+                "Specify exactly one of step.observer, step.observers, or legacy step.output."
+            );
+        }
+        json composite_observer_setting;
         const json* observer_setting = nullptr;
-        if (step.contains("observer")) {
+        if (step.contains("observers")) {
+            if (!step.at("observers").is_array() || step.at("observers").empty()) {
+                throw std::runtime_error("step.observers must be a non-empty array.");
+            }
+            composite_observer_setting = {
+                {"type", "composite"},
+                {"observers", step.at("observers")}
+            };
+            observer_setting = &composite_observer_setting;
+        } else if (step.contains("observer")) {
             observer_setting = &step.at("observer");
         } else if (step.contains("output")) {
             observer_setting = &step.at("output");
@@ -408,7 +517,7 @@ int SimulationRunner::run() {
             }
 
             state->dt = s_setting.at("dt");
-            const long long duration_steps = static_cast<long long>(
+            const long long duration_steps = std::llround(
                 s_setting.at("simulation_time").get<double>() / static_cast<double>(state->dt)
             );
             const long long target_steps = restart.enabled()
@@ -416,22 +525,18 @@ int SimulationRunner::run() {
                 : state->current_steps + duration_steps;
 
             json effective_observer = *observer_setting;
-            std::string segment_trajectory_path;
+            std::vector<SegmentedTrajectory> segment_trajectory_paths;
             std::int64_t segment_start_step = resume_this_step
                 ? resume_selection->record.metadata.at("current_steps").get<std::int64_t>()
                 : state->current_steps;
-            if (restart.enabled() && effective_observer.contains("output_path")) {
+            if (restart.enabled()) {
                 const int segment_id = resume_this_step
                     ? resume_selection->record.metadata.at("segment_id").get<int>() + 1
                     : 0;
-                const std::string original_path = effective_observer.at("output_path").get<string>();
-                const std::string pattern = effective_observer.value(
-                    "segment_output_pattern",
-                    segmented_output_pattern(original_path)
-                );
-                segment_trajectory_path = format_segment_path(pattern, segment_id);
-                effective_observer["output_path"] = segment_trajectory_path;
-                state->trajectory_segment_id = segment_id;
+                segment_trajectory_paths =
+                    segment_observer_outputs(effective_observer, segment_id);
+                state->trajectory_segment_id =
+                    segment_trajectory_paths.empty() ? -1 : segment_id;
                 state->checkpoint_parent_id = resume_this_step
                     ? resume_selection->record.metadata.at("checkpoint_id").get<string>()
                     : std::string();
@@ -440,18 +545,32 @@ int SimulationRunner::run() {
                 state->checkpoint_parent_id.clear();
             }
 
+            if (restart.allow_target_extension && has_auto_dense_until(effective_observer)) {
+                throw std::runtime_error(
+                    "restart.allow_target_extension=true requires explicit numeric "
+                    "dense_until for every dense_log_burst child observer."
+                );
+            }
+
             // オブザーバーの初期化
             this->build_observer(effective_observer, restart.enabled() ? target_steps : duration_steps);
 
             // アンサンブルの初期化
-            this->build_ensemble(s_setting.at("ensemble"));
+            this->build_ensemble(s_setting.at("ensemble"), !resume_this_step);
+            if (!resume_this_step &&
+                s_setting.at("ensemble").value("remove_com_drift_at_start", false)) {
+                md::utils::compute::remove_drift(*state);
+                MD_CUDA_CHECK(cudaStreamSynchronize(state->stream));
+                std::cout << "center-of-mass momentum removed once at phase start" << std::endl;
+            }
             std::optional<md::checkpoint::CheckpointManager> checkpoint_manager;
             if (restart.enabled()) {
                 checkpoint_manager.emplace(
                     restart,
                     setting_path,
                     model_path,
-                    lattice
+                    lattice,
+                    static_cast<int>(step_index)
                 );
             }
             if (resume_this_step) {
@@ -493,6 +612,15 @@ int SimulationRunner::run() {
                     "Use use_graph=false for NNP, NNP_csr, NNP_fixed, and NNP_aoti backends."
                 );
             }
+            if (use_graph && restart.enabled() &&
+                ((restart.checkpoint_interval_steps > 0 &&
+                  restart.checkpoint_interval_steps % 100 != 0) ||
+                 restart.poll_interval_steps % 100 != 0)) {
+                throw std::runtime_error(
+                    "With use_graph=true, restart interval_steps and poll_interval_steps "
+                    "must be multiples of the 100-step CUDA graph block."
+                );
+            }
 
             const auto wall_start = std::chrono::steady_clock::now();
             auto last_checkpoint_time = wall_start;
@@ -501,12 +629,41 @@ int SimulationRunner::run() {
             const auto stop_callback = [&](State& callback_state) {
                 if (!checkpoint_manager) return false;
                 if (callback_state.current_steps >= target_steps) return false;
-                if (callback_state.current_steps % restart.poll_interval_steps != 0) return false;
+
+                const bool step_checkpoint_due =
+                    restart.checkpoint_interval_steps > 0 &&
+                    callback_state.current_steps > 0 &&
+                    callback_state.current_steps % restart.checkpoint_interval_steps == 0 &&
+                    callback_state.current_steps != last_checkpoint_step;
+                const bool poll_due =
+                    callback_state.current_steps % restart.poll_interval_steps == 0;
+                if (!step_checkpoint_due && !poll_due) return false;
+
                 const auto now = std::chrono::steady_clock::now();
                 const double since_checkpoint =
                     std::chrono::duration<double>(now - last_checkpoint_time).count();
                 const double elapsed = std::chrono::duration<double>(now - wall_start).count();
-                if (since_checkpoint >= restart.checkpoint_interval_seconds) {
+
+                const bool time_checkpoint_due =
+                    poll_due &&
+                    restart.checkpoint_interval_seconds > 0.0 &&
+                    since_checkpoint >= restart.checkpoint_interval_seconds;
+                const bool walltime_stop_due =
+                    poll_due &&
+                    restart.checkpoint_on_walltime_stop &&
+                    elapsed >= restart.max_walltime_seconds;
+                const bool signal_stop_due =
+                    poll_due && checkpoint_stop_signal != 0;
+
+                std::vector<std::string> checkpoint_reasons;
+                if (step_checkpoint_due) checkpoint_reasons.push_back("interval_steps");
+                if (time_checkpoint_due) checkpoint_reasons.push_back("interval_seconds");
+                if (walltime_stop_due) checkpoint_reasons.push_back("walltime_stop");
+                if (signal_stop_due && restart.checkpoint_on_signal) {
+                    checkpoint_reasons.push_back("signal");
+                }
+
+                if (!checkpoint_reasons.empty()) {
                     const auto saved = checkpoint_manager->save(
                         callback_state,
                         *integrator,
@@ -514,27 +671,21 @@ int SimulationRunner::run() {
                         *observer,
                         static_cast<int>(step_index),
                         name,
-                        target_steps
+                        target_steps,
+                        checkpoint_reasons,
+                        false
                     );
                     last_checkpoint_time = now;
                     last_checkpoint_step = callback_state.current_steps;
-                    std::cout << "periodic checkpoint saved: "
+                    std::cout << "checkpoint saved: "
                               << saved.metadata.at("checkpoint_id").get<string>() << std::endl;
                 }
-                if (elapsed >= restart.max_walltime_seconds || checkpoint_stop_signal != 0) {
-                    if (last_checkpoint_step != callback_state.current_steps) {
-                        const auto saved = checkpoint_manager->save(
-                            callback_state,
-                            *integrator,
-                            thermostat.get(),
-                            *observer,
-                            static_cast<int>(step_index),
-                            name,
-                            target_steps
+                if (walltime_stop_due || signal_stop_due) {
+                    if (signal_stop_due && !restart.checkpoint_on_signal &&
+                        last_checkpoint_step != callback_state.current_steps) {
+                        throw std::runtime_error(
+                            "Checkpoint stop signal received but restart.save_checkpoint.on_signal=false."
                         );
-                        last_checkpoint_step = callback_state.current_steps;
-                        std::cout << "continuation checkpoint saved: "
-                                  << saved.metadata.at("checkpoint_id").get<string>() << std::endl;
                     }
                     continuation_stop = true;
                     return true;
@@ -546,15 +697,44 @@ int SimulationRunner::run() {
             MD_CUDA_CHECK(cudaDeviceSynchronize());
             observer->finalize(*state);
 
+            if (checkpoint_manager && run_status == Simulator::RunStatus::Completed) {
+                std::vector<std::string> completion_reasons;
+                if (restart.checkpoint_on_phase_end) {
+                    completion_reasons.push_back("phase_end");
+                }
+                const bool workflow_complete = step_index + 1 == j.at("steps").size();
+                if (workflow_complete && restart.checkpoint_on_completion) {
+                    completion_reasons.push_back("completion");
+                }
+                if (!completion_reasons.empty() && last_checkpoint_step != state->current_steps) {
+                    const bool protect =
+                        restart.protect_phase_end_and_completion;
+                    const auto saved = checkpoint_manager->save(
+                        *state,
+                        *integrator,
+                        thermostat.get(),
+                        *observer,
+                        static_cast<int>(step_index),
+                        name,
+                        target_steps,
+                        completion_reasons,
+                        protect
+                    );
+                    last_checkpoint_step = state->current_steps;
+                    std::cout << "completion checkpoint saved: "
+                              << saved.metadata.at("checkpoint_id").get<string>() << std::endl;
+                }
+            }
+
             auto end = std::chrono::steady_clock::now();
             double elapsed_s = std::chrono::duration<double>(end - start).count();
 
             std::cout << "かかった時間：" << elapsed_s << "s" << std::endl;
-            if (restart.enabled() && !segment_trajectory_path.empty()) {
+            if (restart.enabled() && !segment_trajectory_paths.empty()) {
                 update_segment_manifest(
                     restart.directory,
                     state->trajectory_segment_id,
-                    segment_trajectory_path,
+                    segment_trajectory_paths,
                     state->checkpoint_parent_id,
                     segment_start_step,
                     state->current_steps,
@@ -642,12 +822,58 @@ void SimulationRunner::build_cell(const json& c_setting) {
 }
 
 void SimulationRunner::build_observer(const json& o_setting, long long total_steps) {
+    this->observer = make_observer(o_setting, total_steps);
+}
+
+std::unique_ptr<Observer> SimulationRunner::make_observer(
+    const json& o_setting,
+    long long total_steps
+) {
     string o_type = o_setting.value("type", "linear");
 
-    if (o_type == "linear") {
+    if (o_type == "composite") {
+        if (!o_setting.contains("observers") || !o_setting.at("observers").is_array()) {
+            throw std::runtime_error("composite observer requires an observers array.");
+        }
+        std::vector<md::observers::CompositeObserver::Child> children;
+        std::unordered_set<std::string> ids;
+        std::unordered_set<std::string> output_paths;
+        for (const auto& child_setting : o_setting.at("observers")) {
+            if (!child_setting.is_object()) {
+                throw std::runtime_error("Each observers entry must be an object.");
+            }
+            const std::string id = child_setting.at("id").get<std::string>();
+            if (id.empty() || !ids.insert(id).second) {
+                throw std::runtime_error("Duplicate or empty observer id: " + id);
+            }
+            if (child_setting.contains("output_path")) {
+                const std::string path = child_setting.at("output_path").get<std::string>();
+                if (!output_paths.insert(path).second) {
+                    throw std::runtime_error("Duplicate observer output_path: " + path);
+                }
+            }
+            json contract_setting = child_setting;
+            contract_setting.erase("output_path");
+            contract_setting.erase("segment_output_pattern");
+            children.push_back({
+                id,
+                contract_setting.dump(),
+                make_observer(child_setting, total_steps)
+            });
+        }
+        return std::make_unique<md::observers::CompositeObserver>(std::move(children));
+    } else if (o_type == "thermo_monitor") {
+        return std::make_unique<md::observers::ThermoMonitorObserver>(
+            o_setting.at("interval").get<int>(),
+            interaction.get(),
+            cell.get(),
+            o_setting.at("output_path").get<std::string>(),
+            o_setting.value("minimum_pair_distance_A", 0.0f)
+        );
+    } else if (o_type == "linear") {
         int interval = o_setting.at("interval").get<int>();
 
-        this->observer = std::make_unique<md::observers::LinearOutput>(
+        return std::make_unique<md::observers::LinearOutput>(
             interval, 
             interaction.get()
         );
@@ -657,7 +883,7 @@ void SimulationRunner::build_observer(const json& o_setting, long long total_ste
         float log_interval = std::pow(10.0f, 1.0f / (float)divisions);
         int counter = 5;
 
-        this->observer = std::make_unique<md::observers::LogOutput>(
+        return std::make_unique<md::observers::LogOutput>(
             log_interval, 
             counter, 
             interaction.get()
@@ -669,7 +895,7 @@ void SimulationRunner::build_observer(const json& o_setting, long long total_ste
         string output_path = o_setting.at("output_path").get<string>();
         const auto trajectory_spec = parse_trajectory_output_spec(o_setting, o_type, is_unwrap);
 
-        this->observer = std::make_unique<md::observers::LinearExportTrajectory>(
+        return std::make_unique<md::observers::LinearExportTrajectory>(
             interval, 
             *state, 
             cell.get(), 
@@ -685,7 +911,7 @@ void SimulationRunner::build_observer(const json& o_setting, long long total_ste
         string output_path = o_setting.at("output_path").get<string>();
         const auto trajectory_spec = parse_trajectory_output_spec(o_setting, o_type, is_unwrap);
         
-        this->observer = std::make_unique<md::observers::LogExportTrajectory>(
+        return std::make_unique<md::observers::LogExportTrajectory>(
             log_interval, 
             counter, 
             *state, 
@@ -720,7 +946,7 @@ void SimulationRunner::build_observer(const json& o_setting, long long total_ste
             }
         }
 
-        this->observer = std::make_unique<md::observers::DenseLogBurstExportTrajectory>(
+        return std::make_unique<md::observers::DenseLogBurstExportTrajectory>(
             n_per_decade,
             burst_length,
             burst_interval,
@@ -744,7 +970,7 @@ void SimulationRunner::build_observer(const json& o_setting, long long total_ste
         bool is_unwrap = o_setting.value("is_unwrap", false);
         const auto trajectory_spec = parse_trajectory_output_spec(o_setting, o_type, is_unwrap);
 
-        this->observer = std::make_unique<md::observers::TargetTemperatureExporter>(
+        return std::make_unique<md::observers::TargetTemperatureExporter>(
             target_temperatures, 
             initial_temperature, 
             cooling_rate_per_step, 
@@ -758,12 +984,20 @@ void SimulationRunner::build_observer(const json& o_setting, long long total_ste
     }
 }
 
-void SimulationRunner::build_ensemble(const json& e_setting) {
+void SimulationRunner::build_ensemble(
+    const json& e_setting,
+    bool initialize_dynamic_state
+) {
     this->integrator.reset();
     this->thermostat.reset();
     this->scheduler.reset();
     string ensemble = e_setting.value("type", "NVE");
-    bool initialize_velocities = e_setting.value("initialize_velocities", e_setting.value("init_velocities", !velocities_initialized));
+    bool initialize_velocities =
+        initialize_dynamic_state &&
+        e_setting.value(
+            "initialize_velocities",
+            e_setting.value("init_velocities", !velocities_initialized)
+        );
     bool rescale_initial_temperature = e_setting.value("rescale_initial_temperature", false);
 
     const int default_dof = 3 * state->n_atoms;
@@ -830,7 +1064,7 @@ void SimulationRunner::build_ensemble(const json& e_setting) {
                 auto nhc = std::make_unique<md::thermostats::NHC1>(
                     e_setting.value("tau", 1.0f), this->scheduler.get(), state->thermostat_dof
                 );
-                nhc->init(*state);
+                nhc->init(*state, initialize_dynamic_state);
                 this->thermostat = std::move(nhc);
                 this->integrator = std::make_unique<md::integrators::ConstantVolume>(this->thermostat.get());
 
@@ -839,7 +1073,7 @@ void SimulationRunner::build_ensemble(const json& e_setting) {
                 float tau = e_setting.value("tau", 1.0f); 
                 int seed = e_setting.value("seed", 12345);
                 auto bussi = std::make_unique<md::thermostats::BussiThermostat>(tau, this->scheduler.get(), state->thermostat_dof);
-                bussi->init(*state, seed);
+                bussi->init(*state, seed, initialize_dynamic_state);
                 this->thermostat = std::move(bussi);
                 this->integrator = std::make_unique<md::integrators::ConstantVolume>(this->thermostat.get());
 
@@ -848,7 +1082,7 @@ void SimulationRunner::build_ensemble(const json& e_setting) {
                 float gamma = 1.0f / e_setting.value("tau", 1.0f);
                 int seed = e_setting.value("seed", 12345);
                 auto langevin = std::make_unique<md::integrators::LangevinIntegrator>(gamma, seed, this->scheduler.get());
-                langevin->init(*state, seed);
+                langevin->init(*state, seed, initialize_dynamic_state);
                 this->integrator = std::move(langevin);
 
             }

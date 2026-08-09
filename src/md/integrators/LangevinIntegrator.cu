@@ -124,18 +124,24 @@ namespace {
 
 using namespace md::integrators;
 
-void LangevinIntegrator::init(const State& state, unsigned long long seed) {
+void LangevinIntegrator::init(
+    const State& state,
+    unsigned long long seed,
+    bool initialize_rng_state
+) {
     this->dof = 3 * state.n_atoms;
     this->c1 = std::exp(-this->gamma * state.dt);
 
     this->curand_state.resize(state.n_atoms);
 
-    thrust::for_each(
-        thrust::device, 
-        thrust::make_counting_iterator<int>(0), 
-        thrust::make_counting_iterator<int>(state.n_atoms), 
-        InitCurand(thrust::raw_pointer_cast(curand_state.data()), seed)
-    );
+    if (initialize_rng_state) {
+        thrust::for_each(
+            thrust::device,
+            thrust::make_counting_iterator<int>(0),
+            thrust::make_counting_iterator<int>(state.n_atoms),
+            InitCurand(thrust::raw_pointer_cast(curand_state.data()), seed)
+        );
+    }
 }
 
 void LangevinIntegrator::integrateStepOne(State& state) {

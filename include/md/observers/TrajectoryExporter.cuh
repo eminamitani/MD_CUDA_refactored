@@ -19,6 +19,7 @@ namespace md::observers {
         std::string mode = "legacy";
         std::string format = "extxyz";
         bool position = true;
+        bool image = false;
         bool velocity = false;
         bool force = true;
         bool energy = true;
@@ -52,6 +53,7 @@ namespace md::observers {
                 std::int64_t last_production_step = 0;
                 double first_time_fs = 0.0;
                 double last_time_fs = 0.0;
+                std::string sha256;
             };
 
             std::ofstream ofs;
@@ -78,9 +80,10 @@ namespace md::observers {
             bool finalized = false;
 
             void export_frame(State& state, const std::string& extra_comment, bool unwrap);
-            void export_binary_frame(State& state);
+            void export_binary_frame(State& state, const std::string& extra_comment);
             void flush_binary_chunk();
             void write_binary_manifest(const std::string& status) const;
             std::string frame_comment(State& state, const std::string& extra_comment, bool unwrap) const;
+            std::uint64_t binary_record_bytes() const;
     };
 }

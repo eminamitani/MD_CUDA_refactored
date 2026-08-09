@@ -29,7 +29,7 @@ namespace md::thermostats {
             CheckpointBytes save_checkpoint(State& state) const override;
             void load_checkpoint(State& state, const CheckpointBytes& data) override;
 
-            void init(State& state);
+            void init(State& state, bool initialize_chain_state = true);
         
         private:
             void op(State& state);
